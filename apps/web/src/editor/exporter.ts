@@ -86,10 +86,12 @@ async function createHiddenVideo(url: string): Promise<HTMLVideoElement> {
 async function decodeAssetAudio(
   url: string,
   sampleRate: number,
+  file?: File,
 ): Promise<AudioBuffer | null> {
   try {
-    const response = await fetch(url)
-    const arrayBuffer = await response.arrayBuffer()
+    const arrayBuffer = file
+      ? await file.arrayBuffer()
+      : await (await fetch(url)).arrayBuffer()
     const tempCtx = new OfflineAudioContext(2, sampleRate, sampleRate)
     return await tempCtx.decodeAudioData(arrayBuffer)
   } catch {
@@ -112,7 +114,7 @@ async function renderMixedAudio(
     if (decodedCache.has(assetId)) return decodedCache.get(assetId) ?? null
     const asset = assets[assetId]
     if (!asset) return null
-    const buf = await decodeAssetAudio(asset.url, sampleRate)
+    const buf = await decodeAssetAudio(asset.url, sampleRate, asset.file)
     decodedCache.set(assetId, buf)
     return buf
   }
@@ -123,15 +125,25 @@ async function renderMixedAudio(
   for (const clip of videoClips) {
     if (clip.muted || clip.volume <= 0) continue
     const useAi = Boolean(clip.useAiCleanAudio && clip.aiCleanAudioUrl)
-    const buf = useAi
-      ? await decodeAssetAudio(clip.aiCleanAudioUrl!, 48000)
+    let buf = useAi
+      ? await decodeAssetAudio(clip.aiCleanAudioUrl!, sampleRate)
       : await getDecoded(clip.assetId)
-    if (!buf) continue
+    if (!buf && useAi) {
+      buf = await getDecoded(clip.assetId)
+    }
+    if (!buf || buf.duration <= 0.01) continue
+    const offset = Math.max(
+      0,
+      Math.min(clip.sourceStart, Math.max(0, buf.duration - 0.01)),
+    )
+    const dur = Math.max(0.01, Math.min(clip.duration, buf.duration - offset))
+    if (dur <= 0.01) continue
+
     hasAnyAudio = true
     const src = offline.createBufferSource()
     src.buffer = buf
     const gain = offline.createGain()
-    gain.gain.setValueAtTime(clip.volume, clip.timelineStart)
+    gain.gain.setValueAtTime(clip.volume, Math.max(0, clip.timelineStart))
     if (!useAi && clip.removeMusic) {
       createMusicRemovalChain(
         offline,
@@ -144,7 +156,7 @@ async function renderMixedAudio(
       src.connect(gain)
     }
     gain.connect(offline.destination)
-    src.start(clip.timelineStart, clip.sourceStart, clip.duration)
+    src.start(Math.max(0, clip.timelineStart), offset, dur)
   }
 
   // Schedule background music with global fade-in / fade-out
@@ -289,7 +301,7 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
-  const ctx = canvas.getContext('2d')
+  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true })
   if (!ctx) throw new Error('Canvas 2D 컨텍스트를 생성할 수 없습니다.')
 
   try {
@@ -333,9 +345,12 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
       videoEncoder.encode(frame, { keyFrame: f % (fps * 2) === 0 })
       frame.close()
 
-      // Backpressure control so encoder queue doesn't blow memory on 4K sources
-      if (videoEncoder.encodeQueueSize > 8) {
-        await videoEncoder.flush()
+      // Non-blocking backpressure so hardware encoder stays pipelined
+      while (videoEncoder.encodeQueueSize > 16) {
+        if (signal?.aborted) {
+          throw new DOMException('Export aborted', 'AbortError')
+        }
+        await new Promise((r) => setTimeout(r, 2))
       }
 
       if (f % 3 === 0 || f === totalFrames - 1) {
@@ -374,6 +389,9 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
         })
         audioEncoder.encode(audioData)
         audioData.close()
+        if (audioEncoder.encodeQueueSize > 32) {
+          await new Promise((r) => setTimeout(r, 2))
+        }
       }
     }
 
