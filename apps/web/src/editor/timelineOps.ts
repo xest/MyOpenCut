@@ -193,6 +193,206 @@ export function splitClipAtTime(
   return { clips: next, rightId }
 }
 
+export function splitTextClipAtTime(
+  texts: TextClip[],
+  clipId: string,
+  playheadTime: number,
+  createId: () => string,
+): { texts: TextClip[]; rightId: string | null } {
+  const index = texts.findIndex((t) => t.id === clipId)
+  if (index === -1) return { texts, rightId: null }
+
+  const clip = texts[index]
+  const clipEnd = clip.timelineStart + clip.duration
+  if (
+    playheadTime <= clip.timelineStart + MIN_CLIP_DURATION ||
+    playheadTime >= clipEnd - MIN_CLIP_DURATION
+  ) {
+    return { texts, rightId: null }
+  }
+
+  const leftDuration = playheadTime - clip.timelineStart
+  const rightDuration = clipEnd - playheadTime
+  const rightId = createId()
+
+  const leftClip: TextClip = { ...clip, duration: leftDuration }
+  const rightClip: TextClip = {
+    ...clip,
+    id: rightId,
+    timelineStart: playheadTime,
+    duration: rightDuration,
+  }
+
+  const next = [...texts]
+  next.splice(index, 1, leftClip, rightClip)
+  return { texts: next, rightId }
+}
+
+/**
+ * Linked ripple trim-left: trims video clip and shifts/trims overlapping or subsequent text clips in sync.
+ */
+export function trimClipLeftLinked(
+  clips: VideoClip[],
+  texts: TextClip[],
+  clipId: string,
+  playheadTime: number,
+): { clips: VideoClip[]; texts: TextClip[]; nextPlayhead: number | null } {
+  const target = clips.find((c) => c.id === clipId)
+  const { clips: nextClips, nextPlayhead } = trimClipLeft(
+    clips,
+    clipId,
+    playheadTime,
+  )
+  if (!target || nextPlayhead === null) {
+    return { clips: nextClips, texts, nextPlayhead }
+  }
+
+  const oldStart = target.timelineStart
+  const delta = playheadTime - oldStart
+  const nextTexts: TextClip[] = []
+
+  for (const t of texts) {
+    const tEnd = t.timelineStart + t.duration
+    if (tEnd <= oldStart + 0.001) {
+      // Strictly before cut clip
+      nextTexts.push(t)
+    } else if (t.timelineStart < playheadTime - 0.001) {
+      if (tEnd <= playheadTime + MIN_CLIP_DURATION) {
+        // Entirely inside trimmed-out left region -> drop
+        continue
+      }
+      // Spans across playheadTime -> trim left to align with oldStart
+      nextTexts.push({
+        ...t,
+        timelineStart: oldStart,
+        duration: tEnd - playheadTime,
+      })
+    } else {
+      // Starts at or after playheadTime -> ripple left
+      nextTexts.push({
+        ...t,
+        timelineStart: Math.max(oldStart, t.timelineStart - delta),
+      })
+    }
+  }
+
+  return { clips: nextClips, texts: nextTexts, nextPlayhead }
+}
+
+/**
+ * Linked ripple trim-right: trims video clip and shifts/trims overlapping or subsequent text clips in sync.
+ */
+export function trimClipRightLinked(
+  clips: VideoClip[],
+  texts: TextClip[],
+  clipId: string,
+  playheadTime: number,
+): { clips: VideoClip[]; texts: TextClip[] } {
+  const target = clips.find((c) => c.id === clipId)
+  if (!target) return { clips, texts }
+  const oldEnd = target.timelineStart + target.duration
+  const nextClips = trimClipRight(clips, clipId, playheadTime)
+  if (nextClips === clips) return { clips, texts }
+
+  const trimmedAmount = oldEnd - playheadTime
+  const nextTexts: TextClip[] = []
+
+  for (const t of texts) {
+    const tEnd = t.timelineStart + t.duration
+    if (tEnd <= playheadTime + 0.001) {
+      nextTexts.push(t)
+    } else if (t.timelineStart < playheadTime - 0.001) {
+      // Spans across playheadTime -> clamp end to playheadTime (unless it extends past oldEnd, in which case shorten by trimmedAmount)
+      if (tEnd <= oldEnd + 0.001) {
+        nextTexts.push({
+          ...t,
+          duration: Math.max(MIN_CLIP_DURATION, playheadTime - t.timelineStart),
+        })
+      } else {
+        nextTexts.push({
+          ...t,
+          duration: Math.max(MIN_CLIP_DURATION, t.duration - trimmedAmount),
+        })
+      }
+    } else if (t.timelineStart < oldEnd - 0.001) {
+      if (tEnd <= oldEnd + MIN_CLIP_DURATION) {
+        // Entirely inside trimmed-out right region -> drop
+        continue
+      }
+      nextTexts.push({
+        ...t,
+        timelineStart: playheadTime,
+        duration: Math.max(MIN_CLIP_DURATION, tEnd - oldEnd),
+      })
+    } else {
+      // Subsequent text clips ripple left
+      nextTexts.push({
+        ...t,
+        timelineStart: Math.max(playheadTime, t.timelineStart - trimmedAmount),
+      })
+    }
+  }
+
+  return { clips: nextClips, texts: nextTexts }
+}
+
+/**
+ * Remove all gaps between video clips and shift linked text clips by the same delta
+ * as the video clip they belong to.
+ */
+export function removeGapsLinked(
+  clips: VideoClip[],
+  texts: TextClip[],
+): { clips: VideoClip[]; texts: TextClip[] } {
+  const sorted = [...clips].sort((a, b) => a.timelineStart - b.timelineStart)
+  const deltas: { oldStart: number; oldEnd: number; delta: number }[] = []
+  let cursor = 0
+  const nextClips = sorted.map((clip) => {
+    const delta = cursor - clip.timelineStart
+    deltas.push({
+      oldStart: clip.timelineStart,
+      oldEnd: clip.timelineStart + clip.duration,
+      delta,
+    })
+    const updated: VideoClip = {
+      ...clip,
+      timelineStart: cursor,
+    }
+    cursor += clip.duration
+    return updated
+  })
+
+  const nextTexts = texts.map((t) => {
+    const tMid = t.timelineStart + t.duration / 2
+    let match = deltas.find(
+      (d) => tMid >= d.oldStart - 0.001 && tMid <= d.oldEnd + 0.001,
+    )
+    if (!match) {
+      match = deltas.find(
+        (d) =>
+          t.timelineStart >= d.oldStart - 0.001 &&
+          t.timelineStart < d.oldEnd + 0.001,
+      )
+    }
+    if (!match && deltas.length > 0) {
+      // Fallback to nearest preceding video clip
+      for (let i = deltas.length - 1; i >= 0; i--) {
+        if (t.timelineStart >= deltas[i].oldStart - 0.001) {
+          match = deltas[i]
+          break
+        }
+      }
+    }
+    if (!match) return t
+    return {
+      ...t,
+      timelineStart: Math.max(0, t.timelineStart + match.delta),
+    }
+  })
+
+  return { clips: nextClips, texts: nextTexts }
+}
+
 /**
  * Remove all gaps between video clips by sorting by timelineStart and packing sequentially from 0s.
  */

@@ -42,6 +42,9 @@ interface TimelineProps {
   onBeginDrag?: () => void
   onMoveVideoClip: (id: string, nextStart: number) => void
   onMoveTextClip: (id: string, nextStart: number, nextLayer?: number) => void
+  onResizeTextClip: (id: string, nextStart: number, nextDuration: number) => void
+  onDuplicateVideoClip: (id: string) => string | null
+  onDuplicateTextClip: (id: string) => string | null
 }
 
 export function Timeline({
@@ -65,16 +68,21 @@ export function Timeline({
   onBeginDrag,
   onMoveVideoClip,
   onMoveTextClip,
+  onResizeTextClip,
+  onDuplicateVideoClip,
+  onDuplicateTextClip,
 }: TimelineProps) {
   const tracksRef = useRef<HTMLDivElement | null>(null)
   const dragRef = useRef<{
     kind: 'video' | 'text'
+    mode: 'move' | 'resize-left' | 'resize-right'
     id: string
     startX: number
     startY: number
     origStart: number
     origLayer: number
     duration: number
+    altCopy: boolean
     hasMoved: boolean
   } | null>(null)
   const textLayerCount = Math.max(
@@ -183,29 +191,32 @@ export function Timeline({
   }
 
   const startClipDrag = (
-    e: React.PointerEvent<HTMLButtonElement>,
+    e: React.PointerEvent<HTMLElement>,
     kind: 'video' | 'text',
     id: string,
     origStart: number,
     duration: number,
     origLayer = 0,
+    mode: 'move' | 'resize-left' | 'resize-right' = 'move',
   ) => {
     e.stopPropagation()
     onSelect({ kind, id })
     dragRef.current = {
       kind,
+      mode,
       id,
       startX: e.clientX,
       startY: e.clientY,
       origStart,
       origLayer,
       duration,
+      altCopy: mode === 'move' && e.altKey,
       hasMoved: false,
     }
     e.currentTarget.setPointerCapture(e.pointerId)
   }
 
-  const moveClipDrag = (e: React.PointerEvent<HTMLButtonElement>) => {
+  const moveClipDrag = (e: React.PointerEvent<HTMLElement>) => {
     const drag = dragRef.current
     if (!drag || e.buttons !== 1) return
     if (!drag.hasMoved) {
@@ -217,8 +228,44 @@ export function Timeline({
       }
       drag.hasMoved = true
       onBeginDrag?.()
+      if (drag.altCopy) {
+        const dupId =
+          drag.kind === 'video'
+            ? onDuplicateVideoClip(drag.id)
+            : onDuplicateTextClip(drag.id)
+        if (dupId) {
+          drag.id = dupId
+          onSelect({ kind: drag.kind, id: dupId })
+        }
+      }
     }
+
     const deltaSec = (e.clientX - drag.startX) / pxPerSec
+
+    if (drag.kind === 'text' && drag.mode === 'resize-left') {
+      const origEnd = drag.origStart + drag.duration
+      const rawStart = Math.min(origEnd - 0.1, drag.origStart + deltaSec)
+      const snappedStart = Math.min(
+        origEnd - 0.1,
+        snapTime(rawStart, 'text', drag.id),
+      )
+      onResizeTextClip(drag.id, snappedStart, origEnd - snappedStart)
+      return
+    }
+
+    if (drag.kind === 'text' && drag.mode === 'resize-right') {
+      const rawEnd = Math.max(
+        drag.origStart + 0.1,
+        drag.origStart + drag.duration + deltaSec,
+      )
+      const snappedEnd = Math.max(
+        drag.origStart + 0.1,
+        snapTime(rawEnd, 'text', drag.id),
+      )
+      onResizeTextClip(drag.id, drag.origStart, snappedEnd - drag.origStart)
+      return
+    }
+
     const nextStart = snapTime(drag.origStart + deltaSec, drag.kind, drag.id)
     if (drag.kind === 'video') {
       onMoveVideoClip(drag.id, nextStart)
@@ -455,9 +502,10 @@ export function Timeline({
                     const left = t.timelineStart * pxPerSec
                     const width = Math.max(24, t.duration * pxPerSec)
                     return (
-                      <button
+                      <div
                         key={t.id}
-                        type="button"
+                        role="button"
+                        tabIndex={0}
                         onPointerDown={(e) =>
                           startClipDrag(
                             e,
@@ -466,20 +514,59 @@ export function Timeline({
                             t.timelineStart,
                             t.duration,
                             t.layer ?? 0,
+                            'move',
                           )
                         }
                         onPointerMove={moveClipDrag}
                         onPointerUp={endClipDrag}
                         onPointerCancel={endClipDrag}
                         style={{ left: `${left}px`, width: `${width}px` }}
-                        className={`absolute top-1 bottom-1 rounded px-2 text-left text-xs truncate border transition-colors cursor-grab active:cursor-grabbing ${
+                        className={`group absolute top-1 bottom-1 rounded px-2.5 flex items-center text-left text-xs truncate border transition-colors cursor-grab active:cursor-grabbing ${
                           isSelected
                             ? 'bg-violet-600/40 border-violet-400 text-white'
                             : 'bg-violet-950/60 border-violet-700/60 text-violet-200 hover:border-violet-500'
                         }`}
                       >
-                        {t.text || '(빈 텍스트)'}
-                      </button>
+                        <div
+                          onPointerDown={(e) =>
+                            startClipDrag(
+                              e,
+                              'text',
+                              t.id,
+                              t.timelineStart,
+                              t.duration,
+                              t.layer ?? 0,
+                              'resize-left',
+                            )
+                          }
+                          onPointerMove={moveClipDrag}
+                          onPointerUp={endClipDrag}
+                          onPointerCancel={endClipDrag}
+                          className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-violet-400/50 rounded-l"
+                          title="왼쪽 경계 드래그로 시작/길이 조절"
+                        />
+                        <span className="truncate pointer-events-none">
+                          {t.text || '(빈 텍스트)'}
+                        </span>
+                        <div
+                          onPointerDown={(e) =>
+                            startClipDrag(
+                              e,
+                              'text',
+                              t.id,
+                              t.timelineStart,
+                              t.duration,
+                              t.layer ?? 0,
+                              'resize-right',
+                            )
+                          }
+                          onPointerMove={moveClipDrag}
+                          onPointerUp={endClipDrag}
+                          onPointerCancel={endClipDrag}
+                          className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-violet-400/50 rounded-r"
+                          title="오른쪽 경계 드래그로 길이 조절"
+                        />
+                      </div>
                     )
                   })}
               </div>

@@ -64,16 +64,61 @@ export function serializeProject(params: {
   }
 }
 
-export function downloadProjectJson(project: ProjectFileV1, filename?: string) {
-  const json = JSON.stringify(project, null, 2)
-  const blob = new Blob([json], { type: 'application/json' })
+export async function saveBlobWithPicker(
+  blob: Blob,
+  suggestedName: string,
+  description: string,
+  mime: string,
+  extensions: string[],
+): Promise<boolean> {
+  const win = window as Window & {
+    showSaveFilePicker?: (opts?: unknown) => Promise<{
+      createWritable: () => Promise<{
+        write: (data: Blob) => Promise<void>
+        close: () => Promise<void>
+      }>
+    }>
+  }
+  if (typeof win.showSaveFilePicker === 'function') {
+    try {
+      const handle = await win.showSaveFilePicker({
+        suggestedName,
+        types: [{ description, accept: { [mime]: extensions } }],
+      })
+      const writable = await handle.createWritable()
+      await writable.write(blob)
+      await writable.close()
+      return true
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') {
+        return false
+      }
+      // Fall back to anchor download if picker fails
+    }
+  }
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
-  const stamp = new Date().toISOString().slice(0, 10)
   a.href = url
-  a.download = filename ?? `project-${stamp}.myopencut.json`
+  a.download = suggestedName
   a.click()
   URL.revokeObjectURL(url)
+  return true
+}
+
+export async function downloadProjectJson(
+  project: ProjectFileV1,
+  filename?: string,
+): Promise<boolean> {
+  const json = JSON.stringify(project, null, 2)
+  const blob = new Blob([json], { type: 'application/json' })
+  const stamp = new Date().toISOString().slice(0, 10)
+  return saveBlobWithPicker(
+    blob,
+    filename ?? `project-${stamp}.myopencut.json`,
+    'MyOpenCut 프로젝트 파일',
+    'application/json',
+    ['.json'],
+  )
 }
 
 export function parseProjectJson(raw: string): ProjectFileV1 {

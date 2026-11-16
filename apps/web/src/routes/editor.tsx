@@ -38,6 +38,7 @@ import { Progress } from '#/components/ui/progress'
 import { Slider } from '#/components/ui/slider'
 import { Switch } from '#/components/ui/switch'
 import {
+  cacheLocalOnnxModel,
   remixAiSeparatedAudio,
   separateSpeechWithAi,
 } from '#/editor/aiMusicRemoval'
@@ -48,6 +49,7 @@ import {
   loadAutosaveProject,
   parseProjectJson,
   saveAutosaveProject,
+  saveBlobWithPicker,
   serializeProject,
   type ProjectFileV1,
 } from '#/editor/projectStorage'
@@ -59,10 +61,11 @@ import {
   formatTimecode,
   getProjectDuration,
   getVideoTimelineDuration,
-  removeGaps,
+  removeGapsLinked,
   splitClipAtTime,
-  trimClipLeft,
-  trimClipRight,
+  splitTextClipAtTime,
+  trimClipLeftLinked,
+  trimClipRightLinked,
 } from '#/editor/timelineOps'
 import {
   CANVAS_PRESETS,
@@ -226,6 +229,12 @@ function Editor() {
   const audioInputRef = useRef<HTMLInputElement | null>(null)
   const projectInputRef = useRef<HTMLInputElement | null>(null)
   const relinkInputRef = useRef<HTMLInputElement | null>(null)
+  const onnxInputRef = useRef<HTMLInputElement | null>(null)
+  const clipboardRef = useRef<
+    | { kind: 'video'; clip: VideoClip }
+    | { kind: 'text'; clip: TextClip }
+    | null
+  >(null)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [leftCollapsed, setLeftCollapsed] = useState(false)
   const [rightCollapsed, setRightCollapsed] = useState(false)
@@ -574,7 +583,7 @@ function Editor() {
       textClips,
       musicClip,
     })
-    downloadProjectJson(project)
+    void downloadProjectJson(project)
   }, [aspectRatio, playhead, assets, videoClips, textClips, musicClip])
 
   const handleImportProjectFile = useCallback(
@@ -863,38 +872,174 @@ function Editor() {
       : null
 
   const handleTrimLeft = useCallback(() => {
+    if (selection?.kind === 'text') {
+      const target = textClips.find((t) => t.id === selection.id)
+      if (!target) return
+      const tEnd = target.timelineStart + target.duration
+      if (playhead <= target.timelineStart || playhead >= tEnd - 0.1) return
+      pushHistory()
+      setTextClips((prev) =>
+        prev.map((t) =>
+          t.id === selection.id
+            ? { ...t, timelineStart: playhead, duration: tEnd - playhead }
+            : t,
+        ),
+      )
+      return
+    }
     if (selection?.kind !== 'video') return
-    const res = trimClipLeft(videoClips, selection.id, playhead)
+    const res = trimClipLeftLinked(videoClips, textClips, selection.id, playhead)
     if (res.nextPlayhead === null) return
     pushHistory()
     setVideoClips(res.clips)
+    setTextClips(res.texts)
     setPlayhead(res.nextPlayhead)
-  }, [selection, playhead, videoClips, pushHistory])
+  }, [selection, playhead, videoClips, textClips, pushHistory])
 
   const handleTrimRight = useCallback(() => {
+    if (selection?.kind === 'text') {
+      const target = textClips.find((t) => t.id === selection.id)
+      if (!target) return
+      const tEnd = target.timelineStart + target.duration
+      if (playhead >= tEnd || playhead <= target.timelineStart + 0.1) return
+      pushHistory()
+      setTextClips((prev) =>
+        prev.map((t) =>
+          t.id === selection.id
+            ? { ...t, duration: playhead - target.timelineStart }
+            : t,
+        ),
+      )
+      return
+    }
     if (selection?.kind !== 'video') return
-    const next = trimClipRight(videoClips, selection.id, playhead)
-    if (next === videoClips) return
+    const res = trimClipRightLinked(
+      videoClips,
+      textClips,
+      selection.id,
+      playhead,
+    )
+    if (res.clips === videoClips) return
     pushHistory()
-    setVideoClips(next)
-  }, [selection, playhead, videoClips, pushHistory])
+    setVideoClips(res.clips)
+    setTextClips(res.texts)
+  }, [selection, playhead, videoClips, textClips, pushHistory])
 
   const handleSplit = useCallback(() => {
-    if (selection?.kind !== 'video') return
-    const res = splitClipAtTime(videoClips, selection.id, playhead, () =>
+    if (selection?.kind === 'text') {
+      const res = splitTextClipAtTime(textClips, selection.id, playhead, () =>
+        nextId('text'),
+      )
+      if (!res.rightId) return
+      pushHistory()
+      setTextClips(res.texts)
+      setSelection({ kind: 'text', id: res.rightId })
+      return
+    }
+    const targetVideoId =
+      selection?.kind === 'video' ? selection.id : activeVideoClip?.id
+    if (!targetVideoId) return
+    const res = splitClipAtTime(videoClips, targetVideoId, playhead, () =>
       nextId('vclip'),
     )
     if (!res.rightId) return
     pushHistory()
     setVideoClips(res.clips)
+    // Also split any text clips overlapping playhead
+    let nextTexts = textClips
+    for (const t of textClips) {
+      if (
+        playhead > t.timelineStart + 0.1 &&
+        playhead < t.timelineStart + t.duration - 0.1
+      ) {
+        nextTexts = splitTextClipAtTime(nextTexts, t.id, playhead, () =>
+          nextId('text'),
+        ).texts
+      }
+    }
+    setTextClips(nextTexts)
     setSelection({ kind: 'video', id: res.rightId })
-  }, [selection, playhead, videoClips, pushHistory])
+  }, [selection, activeVideoClip, playhead, videoClips, textClips, pushHistory])
 
   const handleRemoveGaps = useCallback(() => {
     if (videoClips.length === 0) return
     pushHistory()
-    setVideoClips((prev) => removeGaps(prev))
-  }, [videoClips.length, pushHistory])
+    const res = removeGapsLinked(videoClips, textClips)
+    setVideoClips(res.clips)
+    setTextClips(res.texts)
+  }, [videoClips, textClips, pushHistory])
+
+  const handleCopySelected = useCallback(() => {
+    if (selection?.kind === 'video') {
+      const found = videoClips.find((c) => c.id === selection.id)
+      if (found) clipboardRef.current = { kind: 'video', clip: { ...found } }
+    } else if (selection?.kind === 'text') {
+      const found = textClips.find((t) => t.id === selection.id)
+      if (found) {
+        clipboardRef.current = {
+          kind: 'text',
+          clip: { ...found, charColors: { ...found.charColors } },
+        }
+      }
+    }
+  }, [selection, videoClips, textClips])
+
+  const handlePasteAtPlayhead = useCallback(() => {
+    const copied = clipboardRef.current
+    if (!copied) return
+    pushHistory()
+    if (copied.kind === 'video') {
+      const id = nextId('vclip')
+      const cloned: VideoClip = {
+        ...copied.clip,
+        id,
+        timelineStart: playhead,
+      }
+      setVideoClips((prev) => [...prev, cloned])
+      setSelection({ kind: 'video', id })
+    } else {
+      const id = nextId('text')
+      const layer = findFreeTextLayer(
+        textClips,
+        playhead,
+        copied.clip.duration,
+      )
+      const cloned: TextClip = {
+        ...copied.clip,
+        id,
+        timelineStart: playhead,
+        layer,
+        charColors: { ...copied.clip.charColors },
+      }
+      setTextClips((prev) => [...prev, cloned])
+      setSelection({ kind: 'text', id })
+    }
+  }, [playhead, textClips, pushHistory])
+
+  const handleDuplicateVideoClip = useCallback(
+    (id: string): string | null => {
+      const src = videoClips.find((c) => c.id === id)
+      if (!src) return null
+      const newId = nextId('vclip')
+      setVideoClips((prev) => [...prev, { ...src, id: newId }])
+      return newId
+    },
+    [videoClips],
+  )
+
+  const handleDuplicateTextClip = useCallback(
+    (id: string): string | null => {
+      const src = textClips.find((t) => t.id === id)
+      if (!src) return null
+      const newId = nextId('text')
+      setTextClips((prev) => [
+        ...prev,
+        { ...src, id: newId, charColors: { ...src.charColors } },
+      ])
+      return newId
+    },
+    [textClips],
+  )
 
   const handleAddText = useCallback(() => {
     pushHistory()
@@ -996,6 +1141,12 @@ function Editor() {
       } else if ((e.key === 'y' || e.key === 'Y') && mod) {
         e.preventDefault()
         handleRedo()
+      } else if ((e.key === 'c' || e.key === 'C') && mod) {
+        e.preventDefault()
+        handleCopySelected()
+      } else if ((e.key === 'v' || e.key === 'V') && mod) {
+        e.preventDefault()
+        handlePasteAtPlayhead()
       } else if (e.key === 'k' || e.key === 'K') {
         e.preventDefault()
         if (mod) {
@@ -1091,6 +1242,8 @@ function Editor() {
     togglePlay,
     handleUndo,
     handleRedo,
+    handleCopySelected,
+    handlePasteAtPlayhead,
     isPlaying,
     handleTrimLeft,
     handleTrimRight,
@@ -1143,17 +1296,18 @@ function Editor() {
         },
       })
 
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `myopencut-fhd-${targetRatio.replace(':', 'x')}-30fps.mp4`
-      a.click()
-      URL.revokeObjectURL(url)
+      const saved = await saveBlobWithPicker(
+        blob,
+        `myopencut-fhd-${targetRatio.replace(':', 'x')}-30fps.mp4`,
+        'MP4 비디오 파일',
+        'video/mp4',
+        ['.mp4'],
+      )
 
       setExportState({
         active: false,
-        progress: 1,
-        status: '완료',
+        progress: saved ? 1 : 0,
+        status: saved ? '완료' : '저장 취소됨',
         targetRatio: null,
         error: null,
       })
@@ -1218,6 +1372,28 @@ function Editor() {
         onChange={(e) => {
           handleRelinkFiles(e.target.files)
           e.target.value = ''
+        }}
+      />
+      <input
+        ref={onnxInputRef}
+        type="file"
+        accept=".onnx"
+        className="hidden"
+        onChange={async (e) => {
+          const file = e.target.files?.[0]
+          e.target.value = ''
+          if (!file) return
+          try {
+            await cacheLocalOnnxModel(file)
+            if (selectedVideoClip) {
+              void handleRunAiMusicRemoval(selectedVideoClip)
+            }
+          } catch (err) {
+            setAiRemovalState((prev) => ({
+              ...prev,
+              error: err instanceof Error ? err.message : String(err),
+            }))
+          }
         }}
       />
 
@@ -2078,9 +2254,20 @@ function Editor() {
 
                         {aiRemovalState.error &&
                           aiRemovalState.clipId === selectedVideoClip.id && (
-                            <p className="text-[11px] text-red-400">
-                              {aiRemovalState.error}
-                            </p>
+                            <div className="space-y-1.5">
+                              <p className="text-[11px] text-red-400">
+                                {aiRemovalState.error}
+                              </p>
+                              <Button
+                                type="button"
+                                size="xs"
+                                variant="outline"
+                                className="h-6 text-[11px] border-zinc-700 text-zinc-300"
+                                onClick={() => onnxInputRef.current?.click()}
+                              >
+                                모델 파일(.onnx) 직접 불러오기
+                              </Button>
+                            </div>
                           )}
 
                         {selectedVideoClip.aiCleanAudioUrl && (
@@ -2341,9 +2528,35 @@ function Editor() {
               </div>
 
               <div className="space-y-1">
-                <div className="flex justify-between text-xs text-zinc-300">
+                <div className="flex items-center justify-between text-xs text-zinc-300">
                   <span>글자 크기</span>
-                  <span className="font-mono">{selectedTextClip.fontSize}px</span>
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="number"
+                      min={12}
+                      max={300}
+                      step={1}
+                      value={selectedTextClip.fontSize}
+                      onChange={(e) => {
+                        const raw = Number(e.target.value)
+                        if (!Number.isFinite(raw)) return
+                        const val = Math.max(12, Math.min(300, raw))
+                        setTextClips((prev) =>
+                          prev.map((t) =>
+                            t.id === selectedTextClip.id
+                              ? {
+                                  ...t,
+                                  fontSize: val,
+                                  strokeWidth: Number((val * 0.1).toFixed(1)),
+                                }
+                              : t,
+                          ),
+                        )
+                      }}
+                      className="w-14 h-6 rounded bg-zinc-900 border border-zinc-700 px-1.5 text-right font-mono text-xs text-zinc-100 focus:border-violet-500 focus:outline-none"
+                    />
+                    <span className="text-[11px] text-zinc-500">px</span>
+                  </div>
                 </div>
                 <Slider
                   min={24}
@@ -2461,11 +2674,29 @@ function Editor() {
               </div>
 
               <div className="space-y-1">
-                <div className="flex justify-between text-xs text-zinc-300">
+                <div className="flex items-center justify-between text-xs text-zinc-300">
                   <span>세로 위치 (Y)</span>
-                  <span className="font-mono">
-                    {Math.round(selectedTextClip.y * 100)}%
-                  </span>
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="number"
+                      min={5}
+                      max={95}
+                      step={1}
+                      value={Math.round(selectedTextClip.y * 100)}
+                      onChange={(e) => {
+                        const raw = Number(e.target.value)
+                        if (!Number.isFinite(raw)) return
+                        const val = Math.max(0.05, Math.min(0.95, raw / 100))
+                        setTextClips((prev) =>
+                          prev.map((t) =>
+                            t.id === selectedTextClip.id ? { ...t, y: val } : t,
+                          ),
+                        )
+                      }}
+                      className="w-14 h-6 rounded bg-zinc-900 border border-zinc-700 px-1.5 text-right font-mono text-xs text-zinc-100 focus:border-violet-500 focus:outline-none"
+                    />
+                    <span className="text-[11px] text-zinc-500">%</span>
+                  </div>
                 </div>
                 <Slider
                   min={aspectRatio === '9:16' ? 0.15 : 0.11}
@@ -2661,6 +2892,7 @@ function Editor() {
                 <li>• ` (백틱): 전체화면 미리보기</li>
                 <li>• T: 텍스트/캡션 추가</li>
                 <li>• Ctrl+M: 현재 비율 FHD 내보내기</li>
+                <li>• Ctrl+C / Ctrl+V / Alt+드래그: 복사 · 붙여넣기</li>
                 <li>• Ctrl+Z / Ctrl+Shift+Z: 실행 취소 · 다시 실행</li>
                 <li>• Delete: 선택 항목 삭제</li>
               </ul>
@@ -2714,6 +2946,17 @@ function Editor() {
             ),
           )
         }
+        onResizeTextClip={(id, nextStart, nextDuration) =>
+          setTextClips((prev) =>
+            prev.map((t) =>
+              t.id === id
+                ? { ...t, timelineStart: nextStart, duration: nextDuration }
+                : t,
+            ),
+          )
+        }
+        onDuplicateVideoClip={handleDuplicateVideoClip}
+        onDuplicateTextClip={handleDuplicateTextClip}
       />
 
       {/* Thumbnail Generator Modal */}
