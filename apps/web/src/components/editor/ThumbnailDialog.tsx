@@ -1,17 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
 import { Download, Image as ImageIcon } from 'lucide-react'
+import { PerCharColorEditor } from '#/components/editor/PerCharColorEditor'
 import { Button } from '#/components/ui/button'
 import { Checkbox } from '#/components/ui/checkbox'
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from '#/components/ui/dialog'
 import { Label } from '#/components/ui/label'
 import { Slider } from '#/components/ui/slider'
-import { Textarea } from '#/components/ui/textarea'
 import { renderThumbnailFrame } from '#/editor/render'
 import {
   CANVAS_PRESETS,
@@ -63,6 +62,7 @@ export function ThumbnailDialog({
     overrideTextEnabled: false,
     overrideText: '',
     overrideTextColor: '#FFFFFF',
+    overrideCharColors: {},
     overrideStrokeColor: '#000000',
     placementMode: 'safe-fill',
     gridPosition: 'center',
@@ -197,31 +197,44 @@ export function ThumbnailDialog({
     )
   }
 
+  const thumbTextAdapter: TextClip = {
+    id: 'thumb-override',
+    text: options.overrideText,
+    defaultColor: options.overrideTextColor,
+    charColors: options.overrideCharColors ?? {},
+    fontSize: options.gridFontSize,
+    fontWeight: 800,
+    strokeColor: options.overrideStrokeColor,
+    strokeWidth: 6,
+    backgroundColor: '',
+    timelineStart: 0,
+    duration: 1,
+    x: 0.5,
+    y: 0.5,
+    align: 'center',
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-4xl bg-zinc-950 border-zinc-800 text-zinc-100">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <ImageIcon className="w-5 h-5 text-sky-400" />
-            현재 프레임 썸네일 만들기 ({playhead.toFixed(2)}초 · {preset.label})
+      <DialogContent className="max-w-5xl max-h-[92vh] overflow-y-auto p-4 bg-zinc-950 border-zinc-800 text-zinc-100">
+        <DialogHeader className="pb-1">
+          <DialogTitle className="flex items-center gap-2 text-base">
+            <ImageIcon className="w-4 h-4 text-sky-400" />
+            현재 프레임 썸네일 ({playhead.toFixed(2)}초 · {preset.label})
           </DialogTitle>
-          <DialogDescription className="text-zinc-400">
-            선택한 프레임에 딤(어둡게)과 대체 오버레이 텍스트를 적용해 FHD
-            썸네일로 저장합니다.
-          </DialogDescription>
         </DialogHeader>
 
-        <div className="grid grid-cols-1 md:grid-cols-12 gap-5 pt-2">
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-start">
           {/* Preview */}
-          <div className="md:col-span-7 flex flex-col items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900/70 p-3 min-h-[320px]">
+          <div className="md:col-span-6 flex flex-col items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900/70 p-2.5">
             <canvas
               ref={previewCanvasRef}
-              className="max-h-[420px] max-w-full rounded shadow-lg border border-zinc-800 object-contain"
+              className="max-h-[54vh] max-w-full rounded shadow-lg border border-zinc-800 object-contain"
               style={{
                 aspectRatio: `${preset.width} / ${preset.height}`,
               }}
             />
-            <div className="mt-2.5 flex items-center gap-2 self-end">
+            <div className="mt-2 flex items-center gap-2 self-end">
               <Checkbox
                 id="thumb-safezone"
                 checked={showSafeZone}
@@ -237,9 +250,9 @@ export function ThumbnailDialog({
           </div>
 
           {/* Controls */}
-          <div className="md:col-span-5 space-y-4">
+          <div className="md:col-span-6 space-y-2.5">
             {/* Dim Option */}
-            <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3 space-y-2.5">
+            <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-2.5 space-y-2">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Checkbox
@@ -258,7 +271,7 @@ export function ThumbnailDialog({
                   />
                   <Label
                     htmlFor="thumb-dim"
-                    className="text-sm font-medium cursor-pointer"
+                    className="text-xs font-medium cursor-pointer"
                   >
                     배경 딤(Dim) 적용
                   </Label>
@@ -268,145 +281,129 @@ export function ThumbnailDialog({
                 </span>
               </div>
               {options.dimEnabled && (
-                <div className="space-y-1">
-                  <Slider
-                    min={5}
-                    max={80}
-                    step={5}
-                    value={[options.dimPercent]}
-                    onValueChange={(val) => {
-                      const v = Array.isArray(val) ? val[0] : val
-                      setOptions((prev) => ({ ...prev, dimPercent: v }))
-                    }}
-                  />
-                  <p className="text-[11px] text-zinc-500">
-                    체크 시 기본값 20% (5% ~ 80% 조절 가능)
-                  </p>
-                </div>
+                <Slider
+                  min={5}
+                  max={80}
+                  step={5}
+                  value={[options.dimPercent]}
+                  onValueChange={(val) => {
+                    const v = Array.isArray(val) ? val[0] : val
+                    setOptions((prev) => ({ ...prev, dimPercent: v }))
+                  }}
+                />
               )}
             </div>
 
             {/* Replacement Overlay Text */}
-            <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3 space-y-3">
-              <div className="flex items-center gap-2">
-                <Checkbox
-                  id="thumb-override"
-                  checked={options.overrideTextEnabled}
-                  onCheckedChange={(checked) =>
-                    setOptions((prev) => ({
-                      ...prev,
-                      overrideTextEnabled: Boolean(checked),
-                    }))
-                  }
-                />
-                <Label
-                  htmlFor="thumb-override"
-                  className="text-sm font-medium cursor-pointer"
-                >
-                  기존 텍스트 대체 오버레이 입력
-                </Label>
+            <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-2.5 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="thumb-override"
+                    checked={options.overrideTextEnabled}
+                    onCheckedChange={(checked) =>
+                      setOptions((prev) => ({
+                        ...prev,
+                        overrideTextEnabled: Boolean(checked),
+                      }))
+                    }
+                  />
+                  <Label
+                    htmlFor="thumb-override"
+                    className="text-xs font-medium cursor-pointer"
+                  >
+                    기존 텍스트 대체 오버레이 입력
+                  </Label>
+                </div>
+                {options.overrideTextEnabled && (
+                  <label className="flex items-center gap-1.5 text-xs text-zinc-300">
+                    외곽선
+                    <input
+                      type="color"
+                      value={options.overrideStrokeColor}
+                      onChange={(e) =>
+                        setOptions((prev) => ({
+                          ...prev,
+                          overrideStrokeColor: e.target.value,
+                        }))
+                      }
+                      className="w-5 h-5 rounded bg-transparent cursor-pointer"
+                    />
+                  </label>
+                )}
               </div>
 
               {options.overrideTextEnabled && (
-                <div className="space-y-3 pt-1">
-                  <Textarea
-                    value={options.overrideText}
-                    onChange={(e) =>
+                <div className="space-y-2.5 pt-0.5">
+                  <PerCharColorEditor
+                    clip={thumbTextAdapter}
+                    onChange={(patch) =>
                       setOptions((prev) => ({
                         ...prev,
-                        overrideText: e.target.value,
+                        ...(patch.text !== undefined
+                          ? { overrideText: patch.text }
+                          : {}),
+                        ...(patch.defaultColor !== undefined
+                          ? { overrideTextColor: patch.defaultColor }
+                          : {}),
+                        ...(patch.charColors !== undefined
+                          ? { overrideCharColors: patch.charColors }
+                          : {}),
                       }))
                     }
-                    rows={3}
-                    placeholder="썸네일에 넣을 제목을 입력하세요&#10;(줄바꿈 가능)"
-                    className="bg-zinc-950 border-zinc-700 text-sm"
                   />
 
-                  <div className="flex items-center gap-4">
-                    <label className="flex items-center gap-1.5 text-xs text-zinc-300">
-                      글자색
-                      <input
-                        type="color"
-                        value={options.overrideTextColor}
-                        onChange={(e) =>
-                          setOptions((prev) => ({
-                            ...prev,
-                            overrideTextColor: e.target.value,
-                          }))
-                        }
-                        className="w-6 h-6 rounded bg-transparent cursor-pointer"
-                      />
-                    </label>
-                    <label className="flex items-center gap-1.5 text-xs text-zinc-300">
-                      외곽선
-                      <input
-                        type="color"
-                        value={options.overrideStrokeColor}
-                        onChange={(e) =>
-                          setOptions((prev) => ({
-                            ...prev,
-                            overrideStrokeColor: e.target.value,
-                          }))
-                        }
-                        className="w-6 h-6 rounded bg-transparent cursor-pointer"
-                      />
-                    </label>
-                  </div>
-
                   {/* Placement Mode */}
-                  <div className="space-y-2">
-                    <Label className="text-xs text-zinc-300">배치 방식</Label>
-                    <div className="grid grid-cols-2 gap-2">
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant={
-                          options.placementMode === 'safe-fill'
-                            ? 'default'
-                            : 'outline'
-                        }
-                        className={
-                          options.placementMode === 'safe-fill'
-                            ? 'bg-sky-500 hover:bg-sky-600 text-white'
-                            : 'border-zinc-700 text-zinc-300'
-                        }
-                        onClick={() =>
-                          setOptions((prev) => ({
-                            ...prev,
-                            placementMode: 'safe-fill',
-                          }))
-                        }
-                      >
-                        세이프존 꽉 채우기
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant={
-                          options.placementMode === 'grid-9'
-                            ? 'default'
-                            : 'outline'
-                        }
-                        className={
-                          options.placementMode === 'grid-9'
-                            ? 'bg-sky-500 hover:bg-sky-600 text-white'
-                            : 'border-zinc-700 text-zinc-300'
-                        }
-                        onClick={() =>
-                          setOptions((prev) => ({
-                            ...prev,
-                            placementMode: 'grid-9',
-                          }))
-                        }
-                      >
-                        9개 방위 배치
-                      </Button>
-                    </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant={
+                        options.placementMode === 'safe-fill'
+                          ? 'default'
+                          : 'outline'
+                      }
+                      className={
+                        options.placementMode === 'safe-fill'
+                          ? 'bg-sky-500 hover:bg-sky-600 text-white'
+                          : 'border-zinc-700 text-zinc-300'
+                      }
+                      onClick={() =>
+                        setOptions((prev) => ({
+                          ...prev,
+                          placementMode: 'safe-fill',
+                        }))
+                      }
+                    >
+                      세이프존 꽉 채우기
+                    </Button>
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant={
+                        options.placementMode === 'grid-9'
+                          ? 'default'
+                          : 'outline'
+                      }
+                      className={
+                        options.placementMode === 'grid-9'
+                          ? 'bg-sky-500 hover:bg-sky-600 text-white'
+                          : 'border-zinc-700 text-zinc-300'
+                      }
+                      onClick={() =>
+                        setOptions((prev) => ({
+                          ...prev,
+                          placementMode: 'grid-9',
+                        }))
+                      }
+                    >
+                      9개 방위 배치
+                    </Button>
                   </div>
 
                   {options.placementMode === 'grid-9' && (
-                    <div className="space-y-2.5">
-                      <div className="grid grid-cols-3 gap-1.5">
+                    <div className="space-y-2">
+                      <div className="grid grid-cols-3 gap-1">
                         {GRID_POSITIONS.map((pos) => (
                           <Button
                             key={pos.id}
@@ -417,11 +414,11 @@ export function ThumbnailDialog({
                                 ? 'default'
                                 : 'outline'
                             }
-                            className={
+                            className={`h-6 text-[11px] ${
                               options.gridPosition === pos.id
                                 ? 'bg-sky-500 hover:bg-sky-600 text-white'
                                 : 'border-zinc-700 text-zinc-300'
-                            }
+                            }`}
                             onClick={() =>
                               setOptions((prev) => ({
                                 ...prev,
@@ -436,7 +433,7 @@ export function ThumbnailDialog({
                       <div className="space-y-1">
                         <div className="flex justify-between text-xs text-zinc-400">
                           <span>글자 크기</span>
-                          <span>{options.gridFontSize}px</span>
+                          <span className="font-mono">{options.gridFontSize}px</span>
                         </div>
                         <Slider
                           min={40}
@@ -455,9 +452,10 @@ export function ThumbnailDialog({
               )}
             </div>
 
-            <div className="flex gap-2 pt-1">
+            <div className="flex gap-2 pt-0.5">
               <Button
                 type="button"
+                size="sm"
                 className="flex-1 bg-sky-500 hover:bg-sky-600 text-white"
                 onClick={() => handleDownload('png')}
               >
@@ -466,6 +464,7 @@ export function ThumbnailDialog({
               </Button>
               <Button
                 type="button"
+                size="sm"
                 variant="outline"
                 className="flex-1 border-zinc-700 text-zinc-200 hover:bg-zinc-800"
                 onClick={() => handleDownload('jpeg')}

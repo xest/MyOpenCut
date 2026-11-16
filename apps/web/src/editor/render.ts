@@ -363,22 +363,40 @@ export function renderThumbnailFrame(params: {
     if (vAlign === 'bottom') startY = anchorY - totalHeight + lineHeight / 2
 
     ctx.font = `800 ${fontSize}px "Inter Variable", "Noto Sans KR", sans-serif`
-    ctx.textAlign = hAlign
+    ctx.textAlign = 'left'
     ctx.textBaseline = 'middle'
     ctx.lineJoin = 'round'
     ctx.miterLimit = 2
     ctx.lineWidth = Math.max(4, fontSize * 0.1)
     ctx.strokeStyle = options.overrideStrokeColor || '#000000'
-    ctx.fillStyle = options.overrideTextColor || '#FFFFFF'
 
     ctx.shadowColor = 'rgba(0, 0, 0, 0.55)'
     ctx.shadowBlur = fontSize * 0.18
     ctx.shadowOffsetY = fontSize * 0.05
 
+    const defaultColor = options.overrideTextColor || '#FFFFFF'
+    const charColors = options.overrideCharColors ?? {}
+    let globalCharIndex = 0
     for (let i = 0; i < lines.length; i++) {
+      const lineChars = Array.from(lines[i])
+      const lineW = lineChars.reduce(
+        (acc, ch) => acc + ctx.measureText(ch).width,
+        0,
+      )
       const y = startY + i * lineHeight
-      ctx.strokeText(lines[i], anchorX, y)
-      ctx.fillText(lines[i], anchorX, y)
+      let cursorX = anchorX - lineW / 2
+      if (hAlign === 'left') cursorX = anchorX
+      if (hAlign === 'right') cursorX = anchorX - lineW
+
+      for (const ch of lineChars) {
+        const chW = ctx.measureText(ch).width
+        ctx.strokeText(ch, cursorX, y)
+        ctx.fillStyle = charColors[globalCharIndex] ?? defaultColor
+        ctx.fillText(ch, cursorX, y)
+        cursorX += chW
+        globalCharIndex += 1
+      }
+      globalCharIndex += 1 // '\n'
     }
   }
 

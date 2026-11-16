@@ -102,6 +102,7 @@ export interface ThumbnailOptions {
   overrideTextEnabled: boolean
   overrideText: string
   overrideTextColor: string
+  overrideCharColors?: Record<number, string>
   overrideStrokeColor: string
   placementMode: 'safe-fill' | 'grid-9'
   gridPosition: NineGridPosition
