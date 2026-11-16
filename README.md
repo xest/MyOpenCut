@@ -1,77 +1,69 @@
-<table width="100%">
-  <tr>
-    <td align="left" width="120">
-      <img src="https://assets.opencut.app/branding/symbol.svg" alt="OpenCut Logo" width="100" />
-    </td>
-    <td align="right">
-      <h1>OpenCut</h1>
-      <h3 style="margin-top: -10px;">A free and open source video editor for web, desktop, and mobile.</h3>
-    </td>
-  </tr>
-</table>
+# MyOpenCut
 
-[![Discord](https://img.shields.io/discord/1386309140057690133?label=Discord&logo=discord&logoColor=fff&color=5865F2&style=flat)](https://discord.gg/zmR9N35cjK)
-[![X](https://img.shields.io/badge/follow-%40opencutapp-000?logo=x&logoColor=fff&style=flat)](https://x.com/opencutapp)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat)](LICENSE)
+**100% 브라우저(클라이언트)에서 동작하는 무료 웹 영상 편집기** (서버 비용 \$0 · [OpenCut](https://github.com/opencut-app/opencut) 기반 커스텀 포크)
 
-## Status
+별도의 백엔드 서버나 업로드 없이 브라우저 내에서 바로 컷 편집, AI 배경음악 제거, 멀티 레이어 자막, 배경음악 페이드, 썸네일 생성, FHD MP4 내보내기까지 처리할 수 있습니다.
 
-**OpenCut is being rewritten from the ground up.** What's coming:
+---
 
-- An Editor API
-- First-class third party plugins (made possible by a plugin-first architecture)
-- Desktop, mobile, and browser from one codebase (Rust core)
-- MCP server (for AI agents)
-- Headless mode (automation, batch rendering)
-- A scripting tab directly in the editor
+## 주요 기능
 
-You can still find the previous version at [opencut-app/opencut-classic](https://github.com/opencut-app/opencut-classic), which is the one to reach for today. [opencut.app](https://opencut.app) still runs the classic version. The rewrite will live at [new.opencut.app](https://new.opencut.app) until it's ready to take over.
+### 1. 2.7K / 4K → FHD (30fps) 편집 & 내보내기
+- **16:9 가로(1920×1080)** 및 **9:16 숏폼(1080×1920)** 동시 지원
+- 네이티브 `<video>` 하드웨어 디코딩 미리보기 + WebCodecs / Canvas 기반 FHD 30fps MP4 내보내기
+- 미리보기 화면 드래그로 영상 위치(Pan X/Y) 및 확대/축소 조절
+- **세이프존(Safe Zone)** 및 **중앙 가이드선(가로·세로)** 토글 (UI 설정 `localStorage` 자동 저장)
 
-## Development
+### 2. 녹음된 배경음악 제거 (AI · 브라우저 온디바이스)
+- `onnxruntime-web`(WebGPU → WASM 폴백)과 `Kim_Vocal_2.onnx` 모델을 브라우저에서 직접 실행해 녹음된 배경음악을 제거합니다. (최초 1회 다운로드 후 Cache API 캐시)
+- **바벨·충격음 보존 (Transient Recovery)**: `원본 - 음성` 잔여 트랙에서 순간 충격음(바벨 드랍, 원판 부딪힘 등)을 감지해 배경음악은 지우고 효과음은 살립니다.
+- **원본 배경음 살짝 섞기**: AI 재실행 없이 캐시된 스템으로 즉시 재믹싱 가능
 
-Install [proto](https://moonrepo.dev/proto) if you haven't already:
+### 3. 멀티 레이어 텍스트 / 캡션
+- **멀티 레이어 트랙**: 동시간대 자막 추가 시 빈 레이어에 자동 배치, 타임라인 상하 드래그 또는 인스펙터에서 레이어 이동 가능
+- **워드 스타일 부분 색상 지정**: 텍스트 입력창에서 원하는 단어/구간만 드래그 선택해 색상 변경 가능
+- **정렬 & 세이프존 자동 보정**: 가로(왼쪽/가운데/오른쪽)·세로(위/가운데/아래) 정렬 프리셋, 글자 크기의 10% 외곽선 자동 유지, 여러 줄 입력 시 세이프존 내부 자동 클램핑
+- 텍스트 추가(`T`) 시 현재 재생헤드 위치 비디오 클립의 시작·종료 길이에 자동 맞춤
 
-**Linux, macOS, WSL:**
+### 4. 타임라인 편집 & 프리미어 프로 단축키
+- `Space`: 재생 / 일시정지
+- `J` / `K` / `L`: 뒤로 / 정지 / 앞으로 재생
+- `Left` / `Right`: ±0.1초 이동 (`Shift`: ±1초)
+- `Up` / `Down`: 이전 / 다음 클립 경계로 이동
+- `Q` / `W`: 현재 재생헤드 기준 앞/뒤 리플 트림
+- `Ctrl + K`: 클립 분할
+- `T`: 텍스트/캡션 추가
+- `Delete` / `Backspace`: 선택 클립 삭제
+- `Ctrl + Z` / `Ctrl + Shift + Z`: 실행 취소 / 다시 실행
+- 빈 공간(갭) 일괄 제거, 타임라인 줌/스크롤
 
-```sh
-bash <(curl -fsSL https://moonrepo.dev/install/proto.sh)
+### 5. 배경 음악 & 썸네일 생성
+- **배경 음악**: 전체 영상 길이 기준 자동 루프·트리밍 및 페이드 인/아웃 적용
+- **썸네일 생성기**: 현재 프레임 기반 20% 어둡게(Dim) + 대체 텍스트 렌더링 + PNG 다운로드
+
+### 6. 프로젝트 저장 / 불러오기 & 자동 저장
+- **수동 저장/불러오기**: `.myopencut.json` 프로젝트 파일 내보내기 및 가져오기
+- **IndexedDB 자동 저장**: 편집 상태를 자동 저장하며, 새로고침 또는 프로젝트 불러오기 시 원본 미디어 파일을 파일명·크기 기준으로 재연결해 복원합니다.
+
+---
+
+## 로컬 실행 방법
+
+```bash
+npm --prefix apps/web install
+npm --prefix apps/web run dev
 ```
 
-**Windows (PowerShell):**
+브라우저에서 `http://localhost:5173/editor` 로 접속하면 바로 편집할 수 있습니다.
 
-```powershell
-irm https://moonrepo.dev/install/proto.ps1 | iex
+### 테스트 및 빌드
+
+```bash
+npm --prefix apps/web test
+npm --prefix apps/web run build
 ```
 
-If shims fail to run, allow local scripts for your user:
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-From the repo root:
-
-```sh
-proto use    # installs the tools pinned in .prototools
-```
-
-```sh
-moon run web:dev       # localhost:5173
-moon run api:dev       # localhost:8787
-moon run desktop:dev   # see apps/desktop/README.md
-```
-
-## Contributing
-
-We're not set up to take outside contributions yet while the architecture is being designed. If you want to follow along, ask questions, or just hang out, [join the Discord](https://discord.gg/zmR9N35cjK) or [open an issue](https://github.com/opencut-app/opencut/issues).
-
-## Sponsors
-
-OpenCut is supported by companies that believe in open source creator tools.
-
-- [**fal.ai**](https://fal.ai?utm_source=github-opencut&utm_campaign=oss): Generative image, video, and audio models all in one place.
-
-Want your logo here? Reach out at [sponsor@opencut.app](mailto:sponsor@opencut.app).
+---
 
 ## License
 
