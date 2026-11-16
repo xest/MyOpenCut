@@ -1,7 +1,10 @@
 import * as ort from 'onnxruntime-web'
 
-const MODEL_URL =
-  'https://huggingface.co/Politrees/UVR_resources/resolve/main/models/MDXNet/Kim_Vocal_2.onnx'
+const MODEL_URLS = [
+  'https://huggingface.co/Politrees/UVR_resources/resolve/main/models/MDXNet/Kim_Vocal_2.onnx',
+  'https://hf-mirror.com/Politrees/UVR_resources/resolve/main/models/MDXNet/Kim_Vocal_2.onnx',
+]
+const MODEL_URL = MODEL_URLS[0]
 const MODEL_CACHE_NAME = 'myopencut-ai-models-v1'
 
 const SAMPLE_RATE = 44100
@@ -153,9 +156,24 @@ async function fetchModelWithCache(
   }
 
   onProgress?.(0.03, 'AI 모델 다운로드 중 (최초 1회 약 64MB)...')
-  const resp = await fetch(MODEL_URL)
-  if (!resp.ok) {
-    throw new Error(`AI 모델 다운로드 실패 (HTTP ${resp.status})`)
+  let resp: Response | null = null
+  let lastError = ''
+  for (const candidateUrl of MODEL_URLS) {
+    try {
+      const r = await fetch(candidateUrl, { mode: 'cors' })
+      if (r.ok) {
+        resp = r
+        break
+      }
+      lastError = `HTTP ${r.status}`
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err)
+    }
+  }
+  if (!resp) {
+    throw new Error(
+      `AI 모델(Kim_Vocal_2.onnx) 다운로드 실패: ${lastError}. 네트워크/방화벽을 확인하거나 아래 '모델 파일(.onnx) 직접 불러오기'를 이용해 주세요.`,
+    )
   }
 
   const total = Number(resp.headers.get('content-length')) || 66_759_214
@@ -199,6 +217,15 @@ async function fetchModelWithCache(
   return full.buffer
 }
 
+export async function cacheLocalOnnxModel(file: File): Promise<void> {
+  const buf = await file.arrayBuffer()
+  if (typeof caches !== 'undefined') {
+    const cache = await caches.open(MODEL_CACHE_NAME)
+    await cache.put(MODEL_URL, new Response(buf))
+  }
+  cachedSession = null
+}
+
 async function getOrCreateSession(
   onProgress?: (pct: number, msg: string) => void,
 ): Promise<ort.InferenceSession> {
@@ -206,17 +233,22 @@ async function getOrCreateSession(
   const modelBuffer = await fetchModelWithCache(onProgress)
   onProgress?.(0.35, 'AI 모델 초기화 중 (WebGPU / WASM)...')
 
-  ort.env.wasm.wasmPaths =
-    'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/'
-
   try {
     cachedSession = await ort.InferenceSession.create(modelBuffer, {
       executionProviders: ['webgpu', 'wasm'],
     })
   } catch {
-    cachedSession = await ort.InferenceSession.create(modelBuffer, {
-      executionProviders: ['wasm'],
-    })
+    try {
+      cachedSession = await ort.InferenceSession.create(modelBuffer, {
+        executionProviders: ['wasm'],
+      })
+    } catch {
+      ort.env.wasm.wasmPaths =
+        'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/'
+      cachedSession = await ort.InferenceSession.create(modelBuffer, {
+        executionProviders: ['wasm'],
+      })
+    }
   }
   return cachedSession
 }
