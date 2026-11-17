@@ -1,11 +1,14 @@
 import { createFileRoute } from '@tanstack/react-router'
 import {
+  BookOpen,
   ChevronLeft,
   ChevronRight,
   Crosshair,
   Download,
   Film,
   FolderOpen,
+  FolderPlus,
+  HelpCircle,
   Image as ImageIcon,
   Maximize2,
   Minimize2,
@@ -30,8 +33,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PerCharColorEditor } from '#/components/editor/PerCharColorEditor'
 import { ThumbnailDialog } from '#/components/editor/ThumbnailDialog'
 import { Timeline } from '#/components/editor/Timeline'
+import { VisualGuideOverlay } from '#/components/editor/VisualGuideOverlay'
 import { Button } from '#/components/ui/button'
 import { Checkbox } from '#/components/ui/checkbox'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '#/components/ui/dialog'
 import { Input } from '#/components/ui/input'
 import { Label } from '#/components/ui/label'
 import { Progress } from '#/components/ui/progress'
@@ -45,11 +56,14 @@ import {
 import { exportFhdMp4 } from '#/editor/exporter'
 import {
   clearAutosaveProject,
-  downloadProjectJson,
   loadAutosaveProject,
   parseProjectJson,
+  resolveSavedAssetFiles,
+  saveAssetHandle,
   saveAutosaveProject,
   saveBlobWithPicker,
+  saveFileInDirectory,
+  saveProjectWithHandle,
   serializeProject,
   type ProjectFileV1,
 } from '#/editor/projectStorage'
@@ -156,6 +170,19 @@ function Editor() {
     videoIds: string[]
     textIds: string[]
   }>({ videoIds: [], textIds: [] })
+  const [videoTrackHidden, setVideoTrackHidden] = useState(false)
+  const [hiddenCaptionLayers, setHiddenCaptionLayers] = useState<number[]>([])
+  const [musicTrackMuted, setMusicTrackMuted] = useState(false)
+  const [audioDb, setAudioDb] = useState<[number, number]>([-60, -60])
+  const [saveFeedback, setSaveFeedback] = useState<string | null>(null)
+  const [welcomeOpen, setWelcomeOpen] = useState(false)
+  const [newProjectName, setNewProjectName] = useState(
+    () => `kremble-${new Date().toISOString().slice(0, 10)}`,
+  )
+  const [workspaceDirHandle, setWorkspaceDirHandle] =
+    useState<FileSystemDirectoryHandle | null>(null)
+  const [guideOpen, setGuideOpen] = useState(false)
+  const projectFileHandleRef = useRef<FileSystemFileHandle | null>(null)
   const [playhead, setPlayhead] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
   const [pxPerSec, setPxPerSec] = useState(50)
@@ -394,19 +421,102 @@ function Editor() {
         : { kind: 'video', id: activeVideoClip.id },
     )
   }, [isPlaying, activeVideoClip])
-  const activeTextClips = useMemo(
-    () => findActiveTextClips(textClips, playhead),
-    [textClips, playhead],
-  )
+  const activeTextClips = useMemo(() => {
+    const all = findActiveTextClips(textClips, playhead)
+    if (hiddenCaptionLayers.length === 0) return all
+    const hidden = new Set(hiddenCaptionLayers)
+    return all.filter((t) => !hidden.has(t.layer ?? 0))
+  }, [textClips, playhead, hiddenCaptionLayers])
 
-  // Music playback with global fade-in/out
+  // Music playback with global fade-in/out (respects track mute toggle without mutating clip properties)
   useMusicPlayer({
     isPlaying,
     playhead,
     totalDuration: Math.max(videoDuration, totalDuration),
-    musicClip,
+    musicClip: musicTrackMuted ? null : musicClip,
     assets,
   })
+
+  // Live Stereo dB Meter sampling during playback
+  const meterRef = useRef<{
+    ctx: AudioContext
+    analyserL: AnalyserNode
+    analyserR: AnalyserNode
+    videoEl: HTMLVideoElement
+  } | null>(null)
+
+  useEffect(() => {
+    if (!isPlaying) {
+      setAudioDb([-60, -60])
+      return
+    }
+    const v = videoElRef.current
+    if (!v) return
+
+    let rafId = 0
+    const setupAndSample = () => {
+      try {
+        if (!meterRef.current || meterRef.current.videoEl !== v) {
+          const cap = (
+            v as HTMLVideoElement & { captureStream?: () => MediaStream }
+          ).captureStream?.()
+          if (cap && cap.getAudioTracks().length > 0) {
+            const ctx = new AudioContext()
+            const src = ctx.createMediaStreamSource(cap)
+            const splitter = ctx.createChannelSplitter(2)
+            const analyserL = ctx.createAnalyser()
+            const analyserR = ctx.createAnalyser()
+            analyserL.fftSize = 256
+            analyserR.fftSize = 256
+            src.connect(splitter)
+            splitter.connect(analyserL, 0)
+            splitter.connect(analyserR, cap.getAudioTracks().length > 0 ? 1 : 0)
+            meterRef.current = { ctx, analyserL, analyserR, videoEl: v }
+          }
+        }
+      } catch {
+        // Fallback to approximate meter if captureStream isn't supported
+      }
+
+      const bufL = new Float32Array(256)
+      const bufR = new Float32Array(256)
+      const poll = () => {
+        const m = meterRef.current
+        if (m && m.analyserL && m.analyserR) {
+          if (m.ctx.state === 'suspended') {
+            void m.ctx.resume().catch(() => {})
+          }
+          m.analyserL.getFloatTimeDomainData(bufL)
+          m.analyserR.getFloatTimeDomainData(bufR)
+          let sumL = 0
+          let sumR = 0
+          for (let i = 0; i < bufL.length; i++) {
+            sumL += bufL[i] * bufL[i]
+            sumR += bufR[i] * bufR[i]
+          }
+          const rmsL = Math.sqrt(sumL / bufL.length)
+          const rmsR = Math.sqrt(sumR / bufR.length)
+          const dbL = rmsL > 1e-4 ? Math.max(-60, 20 * Math.log10(rmsL)) : -60
+          const dbR = rmsR > 1e-4 ? Math.max(-60, 20 * Math.log10(rmsR)) : -60
+          setAudioDb([dbL, dbR])
+        } else if (
+          activeVideoClip &&
+          !activeVideoClip.muted &&
+          activeVideoClip.volume > 0
+        ) {
+          const baseDb = 20 * Math.log10(Math.max(0.01, activeVideoClip.volume)) - 14
+          setAudioDb([baseDb, baseDb])
+        } else {
+          setAudioDb([-60, -60])
+        }
+        rafId = requestAnimationFrame(poll)
+      }
+      rafId = requestAnimationFrame(poll)
+    }
+
+    setupAndSample()
+    return () => cancelAnimationFrame(rafId)
+  }, [isPlaying, activeVideoClip])
 
   const activeAssetUrl = activeVideoClip
     ? assets[activeVideoClip.assetId]?.url ?? ''
@@ -485,24 +595,63 @@ function Editor() {
     }
   }, [activeVideoClip, playhead, isPlaying])
 
-  // Load IndexedDB autosave on mount
+  // Load IndexedDB autosave on mount & auto-resolve saved file handles
   useEffect(() => {
+    document.title = 'Kremble Cut | Phase8'
     let cancelled = false
-    void loadAutosaveProject().then((saved) => {
-      if (cancelled || !saved) return
+    void loadAutosaveProject().then(async (saved) => {
+      if (cancelled) return
       if (
-        saved.videoClips.length === 0 &&
-        saved.textClips.length === 0 &&
-        !saved.musicClip
+        !saved ||
+        (saved.videoClips.length === 0 &&
+          saved.textClips.length === 0 &&
+          !saved.musicClip)
       ) {
+        setWelcomeOpen(true)
+        return
+      }
+      const resolved = await resolveSavedAssetFiles(saved.assets)
+      if (cancelled) return
+      if (resolved.size >= saved.assets.length && saved.assets.length > 0) {
+        applyRestoredProject(saved, resolved, false)
         return
       }
       setPendingProject(saved)
       setPendingIsAutosave(true)
+      setWelcomeOpen(true)
     })
     return () => {
       cancelled = true
     }
+  }, [])
+
+  // Keep latest serialized snapshot in a ref for the 5-minute workspace file autosave timer
+  const latestSnapshotRef = useRef<ProjectFileV1 | null>(null)
+  useEffect(() => {
+    latestSnapshotRef.current = serializeProject({
+      aspectRatio,
+      playhead,
+      assets,
+      videoClips,
+      textClips,
+      musicClip,
+    })
+  }, [aspectRatio, playhead, assets, videoClips, textClips, musicClip])
+
+  // Auto-save project file every 5 minutes when a project file handle is configured
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const handle = projectFileHandleRef.current
+      const snapshot = latestSnapshotRef.current
+      if (!handle || !snapshot) return
+      void saveProjectWithHandle(snapshot, handle, false).then((res) => {
+        if (res.saved) {
+          setSaveFeedback('5분 자동 저장됨')
+          window.setTimeout(() => setSaveFeedback(null), 2000)
+        }
+      })
+    }, 5 * 60 * 1000)
+    return () => window.clearInterval(timer)
   }, [])
 
   // Debounced IndexedDB autosave whenever project state changes
@@ -600,17 +749,92 @@ function Editor() {
     [assets],
   )
 
-  const handleSaveProject = useCallback(() => {
-    const project = serializeProject({
+  const handleStartNewProject = useCallback(async () => {
+    const rawName = newProjectName.trim() || `kremble-${new Date().toISOString().slice(0, 10)}`
+    const fileName = rawName.endsWith('.json')
+      ? rawName
+      : `${rawName}.kremble.json`
+
+    const win = window as Window & {
+      showDirectoryPicker?: (opts?: {
+        mode?: 'read' | 'readwrite'
+      }) => Promise<FileSystemDirectoryHandle>
+    }
+
+    const emptyProject = serializeProject({
       aspectRatio,
-      playhead,
-      assets,
-      videoClips,
-      textClips,
-      musicClip,
+      playhead: 0,
+      assets: {},
+      videoClips: [],
+      textClips: [],
+      musicClip: null,
     })
-    void downloadProjectJson(project)
-  }, [aspectRatio, playhead, assets, videoClips, textClips, musicClip])
+
+    if (typeof win.showDirectoryPicker === 'function') {
+      try {
+        const dirHandle = await win.showDirectoryPicker({ mode: 'readwrite' })
+        const fileHandle = await dirHandle.getFileHandle(fileName, {
+          create: true,
+        })
+        const writable = await fileHandle.createWritable()
+        await writable.write(
+          new Blob([JSON.stringify(emptyProject, null, 2)], {
+            type: 'application/json',
+          }),
+        )
+        await writable.close()
+        setWorkspaceDirHandle(dirHandle)
+        projectFileHandleRef.current = fileHandle
+      } catch (err) {
+        if ((err as Error).name === 'AbortError') return
+      }
+    } else {
+      const res = await saveProjectWithHandle(emptyProject, null, true)
+      if (res.cancelled) return
+      projectFileHandleRef.current = res.handle
+    }
+
+    setAssets({})
+    setVideoClips([])
+    setTextClips([])
+    setMusicClip(null)
+    setSelection(null)
+    setMultiSelection({ videoIds: [], textIds: [] })
+    setPlayhead(0)
+    setPendingProject(null)
+    setPendingIsAutosave(false)
+    setRelinkNotice(null)
+    void clearAutosaveProject()
+    setWelcomeOpen(false)
+    setSaveFeedback(`새 프로젝트 시작 (${fileName})`)
+    window.setTimeout(() => setSaveFeedback(null), 2500)
+  }, [newProjectName, aspectRatio])
+
+  const handleSaveProject = useCallback(
+    async (forceSaveAs = false) => {
+      const project = serializeProject({
+        aspectRatio,
+        playhead,
+        assets,
+        videoClips,
+        textClips,
+        musicClip,
+      })
+      const res = await saveProjectWithHandle(
+        project,
+        projectFileHandleRef.current,
+        forceSaveAs,
+      )
+      if (res.handle) {
+        projectFileHandleRef.current = res.handle
+      }
+      if (res.saved) {
+        setSaveFeedback('저장됨')
+        window.setTimeout(() => setSaveFeedback(null), 1800)
+      }
+    },
+    [aspectRatio, playhead, assets, videoClips, textClips, musicClip],
+  )
 
   const handleImportProjectFile = useCallback(
     async (files: FileList | null) => {
@@ -620,7 +844,8 @@ function Editor() {
         const raw = await file.text()
         const parsed = parseProjectJson(raw)
         setPendingIsAutosave(false)
-        applyRestoredProject(parsed, new Map(), false)
+        const resolved = await resolveSavedAssetFiles(parsed.assets)
+        applyRestoredProject(parsed, resolved, false)
       } catch (err) {
         setRelinkNotice(
           `프로젝트 파일을 읽지 못했습니다: ${err instanceof Error ? err.message : String(err)}`,
@@ -815,9 +1040,17 @@ function Editor() {
     [],
   )
 
-  const handleImportVideos = async (files: FileList | null) => {
+  const handleImportVideos = async (
+    files: FileList | File[] | null,
+    handles?: FileSystemFileHandle[],
+  ) => {
     if (!files || files.length === 0) return
-    for (const file of Array.from(files)) {
+    const wasEmptyProject = videoClips.length === 0 && textClips.length === 0
+    const list = Array.from(files)
+    let createdDefaultCaptions = false
+
+    for (let idx = 0; idx < list.length; idx++) {
+      const file = list[idx]
       const url = URL.createObjectURL(file)
       try {
         const meta = await readVideoMetadata(url)
@@ -832,12 +1065,117 @@ function Editor() {
           height: meta.height,
           resolutionTag: detectResolutionTag(meta.width, meta.height),
         }
+        if (handles?.[idx]) {
+          void saveAssetHandle(asset.id, handles[idx])
+          void saveAssetHandle(`${file.name}::${file.size}`, handles[idx])
+        }
         setAssets((prev) => ({ ...prev, [asset.id]: asset }))
         appendVideoAssetToTimeline(asset, aspectRatio)
+
+        // When starting a brand new project, create 3 default 10s captions:
+        // Layer 0 (캡션 1): 전체화면 텍스트 (10s)
+        // Layer 1 (캡션 2): 하단 가운데 정렬 기본 (10s)
+        // Layer 2 (캡션 3): 상단 오른쪽 정렬 기본 (10s)
+        if (wasEmptyProject && !createdDefaultCaptions) {
+          createdDefaultCaptions = true
+          const fullSize = aspectRatio === '9:16' ? 140 : 180
+          const bottomY = aspectRatio === '9:16' ? 0.76 : 0.86
+          const topY = aspectRatio === '9:16' ? 0.16 : 0.13
+          const rightX = aspectRatio === '9:16' ? 0.86 : 0.92
+          const defaultCaptions: TextClip[] = [
+            {
+              id: nextId('text'),
+              text: '전체화면 텍스트',
+              defaultColor: '#FFFFFF',
+              charColors: {},
+              fontSize: fullSize,
+              fontWeight: 800,
+              strokeColor: '#000000',
+              strokeWidth: Number((fullSize * 0.1).toFixed(1)),
+              backgroundColor: '',
+              timelineStart: 0,
+              duration: 10,
+              layer: 0,
+              x: 0.5,
+              y: 0.5,
+              align: 'center',
+              isDynamic: true,
+              transition: 'shrink',
+              transitionDuration: 0.35,
+              transitionStartPos: 'center',
+              transitionEndPos: 'center',
+              transitionEndBehavior: 'stay',
+            },
+            {
+              id: nextId('text'),
+              text: '캡션을 입력하세요',
+              defaultColor: '#FFFFFF',
+              charColors: {},
+              fontSize: 64,
+              fontWeight: 700,
+              strokeColor: '#000000',
+              strokeWidth: 6.4,
+              backgroundColor: '',
+              timelineStart: 0,
+              duration: 10,
+              layer: 1,
+              x: 0.5,
+              y: bottomY,
+              align: 'center',
+              transition: 'none',
+            },
+            {
+              id: nextId('text'),
+              text: '상단 캡션',
+              defaultColor: '#FFFFFF',
+              charColors: {},
+              fontSize: 64,
+              fontWeight: 700,
+              strokeColor: '#000000',
+              strokeWidth: 6.4,
+              backgroundColor: '',
+              timelineStart: 0,
+              duration: 10,
+              layer: 2,
+              x: rightX,
+              y: topY,
+              align: 'right',
+              transition: 'none',
+            },
+          ]
+          setTextClips(defaultCaptions)
+        }
       } catch {
         URL.revokeObjectURL(url)
       }
     }
+  }
+
+  const pickVideosWithHandles = async () => {
+    const win = window as Window & {
+      showOpenFilePicker?: (opts?: unknown) => Promise<FileSystemFileHandle[]>
+    }
+    if (typeof win.showOpenFilePicker === 'function') {
+      try {
+        const handles = await win.showOpenFilePicker({
+          multiple: true,
+          types: [
+            {
+              description: '비디오 파일',
+              accept: {
+                'video/*': ['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'],
+              },
+            },
+          ],
+        })
+        const files = await Promise.all(handles.map((h) => h.getFile()))
+        await handleImportVideos(files, handles)
+        return
+      } catch (err) {
+        if ((err as Error).name === 'AbortError') return
+      }
+    }
+    videoInputRef.current?.click()
   }
 
   const handleImportMusic = async (files: FileList | null) => {
@@ -1164,7 +1502,7 @@ function Editor() {
     const defaultSize = aspectRatio === '9:16' ? 140 : 180
     const newText: TextClip = {
       id,
-      text: '다이내믹 텍스트',
+      text: '전체화면 텍스트',
       defaultColor: '#FFFFFF',
       charColors: {},
       fontSize: defaultSize,
@@ -1506,24 +1844,38 @@ function Editor() {
         textClips,
         musicClip,
         assets,
+        videoTrackHidden,
+        hiddenCaptionLayers,
+        musicTrackMuted,
         signal: controller.signal,
         onProgress: (progress, status) => {
           setExportState((prev) => ({ ...prev, progress, status }))
         },
       })
 
-      const saved = await saveBlobWithPicker(
-        blob,
-        `myopencut-fhd-${targetRatio.replace(':', 'x')}-30fps.mp4`,
-        'MP4 비디오 파일',
-        'video/mp4',
-        ['.mp4'],
-      )
+      const mp4Name = `kremble-cut-fhd-${targetRatio.replace(':', 'x')}-30fps.mp4`
+      let saved = false
+      if (workspaceDirHandle) {
+        saved = await saveFileInDirectory(workspaceDirHandle, mp4Name, blob)
+      }
+      if (!saved) {
+        saved = await saveBlobWithPicker(
+          blob,
+          mp4Name,
+          'MP4 비디오 파일',
+          'video/mp4',
+          ['.mp4'],
+        )
+      }
 
       setExportState({
         active: false,
         progress: saved ? 1 : 0,
-        status: saved ? '완료' : '저장 취소됨',
+        status: saved
+          ? workspaceDirHandle
+            ? `작업 폴더에 저장됨: ${mp4Name}`
+            : '완료'
+          : '저장 취소됨',
         targetRatio: null,
         error: null,
       })
@@ -1618,15 +1970,20 @@ function Editor() {
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 font-semibold text-sm">
             <Film className="w-4 h-4 text-sky-400" />
-            <span>MyOpenCut</span>
+            <span>Kremble Cut</span>
           </div>
-          <span className="rounded bg-zinc-800 px-2 py-0.5 text-[11px] font-mono text-zinc-300">
-            2.7K/4K → FHD {DEFAULT_FPS}fps
-          </span>
+          {saveFeedback && (
+            <span className="rounded bg-emerald-950/70 border border-emerald-700/50 px-2 py-0.5 text-[11px] text-emerald-300">
+              {saveFeedback}
+            </span>
+          )}
         </div>
 
         {/* Aspect Ratio Switcher */}
-        <div className="flex items-center gap-1.5 rounded-lg bg-zinc-950 p-1 border border-zinc-800">
+        <div
+          data-guide="aspect-ratio"
+          className="flex items-center gap-1.5 rounded-lg bg-zinc-950 p-1 border border-zinc-800"
+        >
           <Button
             type="button"
             size="sm"
@@ -1657,30 +2014,42 @@ function Editor() {
           </Button>
         </div>
 
-        {/* Actions: Project Save/Load, Safe Zone, Center Guide, Thumbnail, FHD Exports */}
+        {/* Actions: Project Save/SaveAs/Load, Safe Zone, Center Guide, Thumbnail, FHD Exports */}
         <div className="flex flex-wrap items-center gap-2">
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            className="h-8 text-xs border-zinc-700 text-zinc-200 hover:bg-zinc-800"
-            onClick={handleSaveProject}
-            title="타임라인/자막/효과 설정을 .myopencut.json 파일로 저장"
-          >
-            <Save className="w-3.5 h-3.5 mr-1" />
-            프로젝트 저장
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            className="h-8 text-xs border-zinc-700 text-zinc-200 hover:bg-zinc-800"
-            onClick={() => projectInputRef.current?.click()}
-            title=".myopencut.json 프로젝트 파일 불러오기"
-          >
-            <FolderOpen className="w-3.5 h-3.5 mr-1" />
-            불러오기
-          </Button>
+          <div data-guide="header-save" className="flex items-center gap-1.5">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-8 text-xs border-zinc-700 text-zinc-200 hover:bg-zinc-800"
+              onClick={() => void handleSaveProject(false)}
+              title="저장 (최초 1회 위치 지정 후 같은 파일에 바로 덮어쓰기)"
+            >
+              <Save className="w-3.5 h-3.5 mr-1" />
+              저장
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-8 text-xs border-zinc-700 text-zinc-200 hover:bg-zinc-800"
+              onClick={() => void handleSaveProject(true)}
+              title="새 위치/파일 이름으로 저장"
+            >
+              다른 이름으로 저장
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-8 text-xs border-zinc-700 text-zinc-200 hover:bg-zinc-800"
+              onClick={() => projectInputRef.current?.click()}
+              title="프로젝트 파일 불러오기"
+            >
+              <FolderOpen className="w-3.5 h-3.5 mr-1" />
+              불러오기
+            </Button>
+          </div>
 
           <Button
             type="button"
@@ -1713,40 +2082,53 @@ function Editor() {
             중앙선
           </Button>
 
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            disabled={!activeVideoClip}
-            className="h-8 text-xs border-amber-500/50 text-amber-300 hover:bg-amber-950/40"
-            onClick={() => {
-              setIsPlaying(false)
-              setThumbnailOpen(true)
-            }}
-          >
-            <ImageIcon className="w-3.5 h-3.5 mr-1.5" />
-            현재 프레임 썸네일
-          </Button>
+          <div data-guide="export-actions" className="flex items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={!activeVideoClip}
+              className="h-8 text-xs border-amber-500/50 text-amber-300 hover:bg-amber-950/40"
+              onClick={() => {
+                setIsPlaying(false)
+                setThumbnailOpen(true)
+              }}
+            >
+              <ImageIcon className="w-3.5 h-3.5 mr-1.5" />
+              현재 프레임 썸네일
+            </Button>
 
+            <Button
+              type="button"
+              size="sm"
+              disabled={videoClips.length === 0 || exportState.active}
+              className="h-8 text-xs bg-emerald-600 hover:bg-emerald-700 text-white"
+              onClick={() => void handleExport('16:9')}
+            >
+              <Download className="w-3.5 h-3.5 mr-1" />
+              FHD 16:9 내보내기
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              disabled={videoClips.length === 0 || exportState.active}
+              className="h-8 text-xs bg-violet-600 hover:bg-violet-700 text-white"
+              onClick={() => void handleExport('9:16')}
+            >
+              <Download className="w-3.5 h-3.5 mr-1" />
+              FHD 9:16 내보내기
+            </Button>
+          </div>
           <Button
             type="button"
             size="sm"
-            disabled={videoClips.length === 0 || exportState.active}
-            className="h-8 text-xs bg-emerald-600 hover:bg-emerald-700 text-white"
-            onClick={() => void handleExport('16:9')}
+            variant="ghost"
+            className="h-8 text-xs text-zinc-300 hover:text-white"
+            onClick={() => setGuideOpen(true)}
+            title="화면 구성 요소별 비주얼 가이드 보기"
           >
-            <Download className="w-3.5 h-3.5 mr-1" />
-            FHD 16:9 내보내기
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            disabled={videoClips.length === 0 || exportState.active}
-            className="h-8 text-xs bg-violet-600 hover:bg-violet-700 text-white"
-            onClick={() => void handleExport('9:16')}
-          >
-            <Download className="w-3.5 h-3.5 mr-1" />
-            FHD 9:16 내보내기
+            <HelpCircle className="w-3.5 h-3.5 mr-1 text-sky-400" />
+            가이드
           </Button>
         </div>
       </header>
@@ -1885,7 +2267,10 @@ function Editor() {
             </button>
           </aside>
         ) : (
-          <aside className="w-64 shrink-0 border-r border-zinc-800 bg-zinc-900/40 flex flex-col overflow-hidden">
+          <aside
+            data-guide="media-panel"
+            className="w-64 shrink-0 border-r border-zinc-800 bg-zinc-900/40 flex flex-col overflow-hidden"
+          >
             <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-800/80 shrink-0">
               <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
                 미디어
@@ -1906,7 +2291,7 @@ function Editor() {
               type="button"
               size="sm"
               className="w-full bg-sky-500 hover:bg-sky-600 text-white text-xs"
-              onClick={() => videoInputRef.current?.click()}
+              onClick={() => void pickVideosWithHandles()}
             >
               <Upload className="w-3.5 h-3.5 mr-1.5" />
               영상 추가 (2.7K / 4K)
@@ -1975,7 +2360,10 @@ function Editor() {
         )}
 
         {/* Center: Canvas Preview + Transport */}
-        <main className="flex-1 flex flex-col min-w-0 bg-zinc-950">
+        <main
+          data-guide="preview-stage"
+          className="flex-1 flex flex-col min-w-0 bg-zinc-950"
+        >
           <div
             ref={previewStageRef}
             className="relative flex-1 flex items-center justify-center p-4 min-h-0 overflow-hidden bg-zinc-950 [container-type:size]"
@@ -2061,7 +2449,7 @@ function Editor() {
                 onLoadedData={drawPreview}
                 onSeeked={drawPreview}
                 className={`w-full h-full pointer-events-none transition-opacity ${
-                  activeVideoClip ? 'opacity-100' : 'opacity-0'
+                  activeVideoClip && !videoTrackHidden ? 'opacity-100' : 'opacity-0'
                 } ${
                   activeVideoClip?.fitMode === 'cover'
                     ? 'object-cover'
@@ -2219,7 +2607,10 @@ function Editor() {
             </button>
           </aside>
         ) : (
-          <aside className="w-80 shrink-0 border-l border-zinc-800 bg-zinc-900/40 flex flex-col overflow-hidden">
+          <aside
+            data-guide="inspector"
+            className="w-80 shrink-0 border-l border-zinc-800 bg-zinc-900/40 flex flex-col overflow-hidden"
+          >
             <div className="flex items-center justify-between px-3.5 py-2 border-b border-zinc-800/80 shrink-0">
               <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
                 속성 · 단축키
@@ -2328,6 +2719,39 @@ function Editor() {
                         해제
                       </Button>
                     </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-xs text-zinc-300">
+                      <span>일괄 볼륨</span>
+                      <span className="font-mono text-[11px] text-sky-300">
+                        {Math.round(
+                          ((videoClips.find((c) =>
+                            multiSelection.videoIds.includes(c.id),
+                          )?.volume ?? 1) *
+                            100),
+                        )}
+                        %
+                      </span>
+                    </div>
+                    <Slider
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={[
+                        videoClips.find((c) =>
+                          multiSelection.videoIds.includes(c.id),
+                        )?.volume ?? 1,
+                      ]}
+                      onValueChange={(raw) => {
+                        const val = Array.isArray(raw) ? raw[0] : raw
+                        const vSet = new Set(multiSelection.videoIds)
+                        setVideoClips((prev) =>
+                          prev.map((c) =>
+                            vSet.has(c.id) ? { ...c, volume: val } : c,
+                          ),
+                        )
+                      }}
+                    />
                   </div>
                 </div>
               )}
@@ -2906,7 +3330,7 @@ function Editor() {
                   }`}
                 >
                   {selectedTextClip.isDynamic
-                    ? '다이내믹 텍스트 설정'
+                    ? '전체화면 텍스트 설정'
                     : '캡션 설정'}
                 </h3>
                 <div className="flex items-center gap-1">
@@ -3625,7 +4049,8 @@ function Editor() {
       </div>
 
       {/* Bottom: Multi-track Timeline */}
-      <Timeline
+      <div data-guide="timeline">
+        <Timeline
         playhead={playhead}
         totalDuration={totalDuration}
         pxPerSec={pxPerSec}
@@ -3675,6 +4100,20 @@ function Editor() {
             ),
           )
         }
+        onResizeVideoClip={(id, nextStart, nextDuration, nextSourceStart) =>
+          setVideoClips((prev) =>
+            prev.map((c) =>
+              c.id === id
+                ? {
+                    ...c,
+                    timelineStart: nextStart,
+                    duration: nextDuration,
+                    sourceStart: nextSourceStart,
+                  }
+                : c,
+            ),
+          )
+        }
         onResizeTextClip={(id, nextStart, nextDuration) =>
           setTextClips((prev) =>
             prev.map((t) =>
@@ -3686,7 +4125,64 @@ function Editor() {
         }
         onDuplicateVideoClip={handleDuplicateVideoClip}
         onDuplicateTextClip={handleDuplicateTextClip}
+        onToggleTrackSelect={(kind, layer) => {
+          if (kind === 'video') {
+            const allIds = videoClips.map((c) => c.id)
+            const allSelected =
+              allIds.length > 0 &&
+              allIds.every((id) => multiSelection.videoIds.includes(id))
+            if (allSelected) {
+              setMultiSelection((prev) => ({ ...prev, videoIds: [] }))
+              setSelection(null)
+            } else {
+              setMultiSelection({ videoIds: allIds, textIds: [] })
+              setSelection(
+                allIds.length === 1 ? { kind: 'video', id: allIds[0] } : null,
+              )
+            }
+          } else if (kind === 'text') {
+            const layerIds = textClips
+              .filter((t) => (t.layer ?? 0) === (layer ?? 0))
+              .map((t) => t.id)
+            const allSelected =
+              layerIds.length > 0 &&
+              layerIds.every((id) => multiSelection.textIds.includes(id))
+            if (allSelected) {
+              setMultiSelection((prev) => ({
+                ...prev,
+                textIds: prev.textIds.filter((id) => !layerIds.includes(id)),
+              }))
+              setSelection(null)
+            } else {
+              setMultiSelection({ videoIds: [], textIds: layerIds })
+              setSelection(
+                layerIds.length === 1 ? { kind: 'text', id: layerIds[0] } : null,
+              )
+            }
+          } else if (kind === 'music' && musicClip) {
+            setMultiSelection({ videoIds: [], textIds: [] })
+            setSelection((prev) =>
+              prev?.kind === 'music' && prev.id === musicClip.id
+                ? null
+                : { kind: 'music', id: musicClip.id },
+            )
+          }
+        }}
+        videoTrackHidden={videoTrackHidden}
+        hiddenCaptionLayers={hiddenCaptionLayers}
+        musicTrackMuted={musicTrackMuted}
+        onToggleVideoTrackHidden={() => setVideoTrackHidden((v) => !v)}
+        onToggleCaptionLayerHidden={(layer) =>
+          setHiddenCaptionLayers((prev) =>
+            prev.includes(layer)
+              ? prev.filter((l) => l !== layer)
+              : [...prev, layer],
+          )
+        }
+        onToggleMusicTrackMuted={() => setMusicTrackMuted((m) => !m)}
+        audioDb={audioDb}
       />
+      </div>
 
       {/* Thumbnail Generator Modal */}
       <ThumbnailDialog
@@ -3697,6 +4193,90 @@ function Editor() {
         videoElement={videoElRef.current}
         videoClip={activeVideoClip}
         activeTexts={activeTextClips}
+        workspaceDirHandle={workspaceDirHandle}
+      />
+
+      {/* Welcome / Project Setup Dialog */}
+      <Dialog open={welcomeOpen} onOpenChange={setWelcomeOpen}>
+        <DialogContent className="sm:max-w-[520px] bg-zinc-950 border-zinc-800 text-zinc-100">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <Film className="w-5 h-5 text-sky-400" />
+              Kremble Cut 시작하기
+            </DialogTitle>
+            <DialogDescription className="text-zinc-400 text-xs">
+              새 프로젝트의 작업 폴더와 파일 이름을 설정하거나, 화면 구성
+              가이드를 먼저 살펴보세요.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 pt-1">
+            <div className="rounded-lg border border-sky-800/50 bg-sky-950/20 p-3.5 space-y-2.5">
+              <div className="flex items-center gap-2 text-sm font-semibold text-sky-300">
+                <FolderPlus className="w-4 h-4" />
+                새 프로젝트 시작
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs text-zinc-300">
+                  프로젝트 파일 이름
+                </Label>
+                <Input
+                  value={newProjectName}
+                  onChange={(e) => setNewProjectName(e.target.value)}
+                  placeholder="예: squat-vlog-01"
+                  className="h-8 bg-zinc-900 border-zinc-700 text-xs"
+                />
+              </div>
+              <p className="text-[11px] text-zinc-400">
+                폴더를 선택하면 해당 폴더가 작업 폴더로 지정되며, 프로젝트
+                파일(5분마다 자동 저장)·내보낸 MP4·썸네일이 모두 작업 폴더에
+                바로 저장됩니다.
+              </p>
+              <Button
+                type="button"
+                className="w-full bg-sky-500 hover:bg-sky-600 text-white text-xs"
+                onClick={() => void handleStartNewProject()}
+              >
+                <FolderPlus className="w-3.5 h-3.5 mr-1.5" />
+                작업 폴더 선택하고 새 프로젝트 시작
+              </Button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2.5">
+              <Button
+                type="button"
+                variant="outline"
+                className="h-10 border-zinc-700 bg-zinc-900/70 hover:bg-zinc-800 text-zinc-200 text-xs"
+                onClick={() => {
+                  setWelcomeOpen(false)
+                  setGuideOpen(true)
+                }}
+              >
+                <BookOpen className="w-4 h-4 mr-1.5 text-amber-400" />
+                사용 가이드 보기
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                className="h-10 border-zinc-700 bg-zinc-900/70 hover:bg-zinc-800 text-zinc-300 text-xs"
+                onClick={() => {
+                  setWelcomeOpen(false)
+                  projectInputRef.current?.click()
+                }}
+              >
+                <FolderOpen className="w-4 h-4 mr-1.5 text-emerald-400" />
+                기존 프로젝트 열기
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Interactive Visual Guide Overlay */}
+      <VisualGuideOverlay
+        open={guideOpen}
+        onClose={() => setGuideOpen(false)}
+        onStartNewProject={() => setWelcomeOpen(true)}
       />
     </div>
   )

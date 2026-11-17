@@ -48,9 +48,23 @@ interface TimelineProps {
   onBeginDrag?: () => void
   onMoveVideoClip: (id: string, nextStart: number) => void
   onMoveTextClip: (id: string, nextStart: number, nextLayer?: number) => void
+  onResizeVideoClip?: (
+    id: string,
+    nextStart: number,
+    nextDuration: number,
+    nextSourceStart: number,
+  ) => void
   onResizeTextClip: (id: string, nextStart: number, nextDuration: number) => void
   onDuplicateVideoClip: (id: string) => string | null
   onDuplicateTextClip: (id: string) => string | null
+  onToggleTrackSelect?: (kind: 'video' | 'text' | 'music', layer?: number) => void
+  videoTrackHidden?: boolean
+  hiddenCaptionLayers?: number[]
+  musicTrackMuted?: boolean
+  onToggleVideoTrackHidden?: () => void
+  onToggleCaptionLayerHidden?: (layer: number) => void
+  onToggleMusicTrackMuted?: () => void
+  audioDb?: [number, number]
 }
 
 export function Timeline({
@@ -79,9 +93,18 @@ export function Timeline({
   onBeginDrag,
   onMoveVideoClip,
   onMoveTextClip,
+  onResizeVideoClip,
   onResizeTextClip,
   onDuplicateVideoClip,
   onDuplicateTextClip,
+  onToggleTrackSelect,
+  videoTrackHidden = false,
+  hiddenCaptionLayers = [],
+  musicTrackMuted = false,
+  onToggleVideoTrackHidden,
+  onToggleCaptionLayerHidden,
+  onToggleMusicTrackMuted,
+  audioDb = [-60, -60],
 }: TimelineProps) {
   const tracksRef = useRef<HTMLDivElement | null>(null)
   const tracksAreaRef = useRef<HTMLDivElement | null>(null)
@@ -106,6 +129,8 @@ export function Timeline({
     startX: number
     startY: number
     origStart: number
+    origSourceStart: number
+    origSourceDuration: number
     origLayer: number
     duration: number
     altCopy: boolean
@@ -123,7 +148,7 @@ export function Timeline({
   const timelineLength = Math.max(totalDuration + 4, 15)
   const trackWidthPx = Math.max(800, timelineLength * pxPerSec)
 
-  const MIN_ZOOM = 5
+  const MIN_ZOOM = 1
   const MAX_ZOOM = 240
   const clampZoom = (v: number) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, v))
 
@@ -201,6 +226,11 @@ export function Timeline({
     for (const t of textClips) {
       if (kind === 'text' && t.id === id) continue
       targets.push(t.timelineStart, t.timelineStart + t.duration)
+      if ((t.transition ?? 'none') !== 'none') {
+        targets.push(
+          t.timelineStart + Math.max(0.05, t.transitionDuration ?? 0.35),
+        )
+      }
     }
     let best = clamped
     let bestDist = snapThreshold
@@ -230,6 +260,8 @@ export function Timeline({
     duration: number,
     origLayer = 0,
     mode: 'move' | 'resize-left' | 'resize-right' = 'move',
+    origSourceStart = 0,
+    origSourceDuration = duration,
   ) => {
     e.stopPropagation()
     if (e.shiftKey && mode === 'move' && onToggleMultiSelect) {
@@ -246,6 +278,8 @@ export function Timeline({
       startX: e.clientX,
       startY: e.clientY,
       origStart,
+      origSourceStart,
+      origSourceDuration,
       origLayer,
       duration,
       altCopy: mode === 'move' && e.altKey,
@@ -293,6 +327,46 @@ export function Timeline({
       const stepDelta = deltaSec - drag.lastDeltaSec
       drag.lastDeltaSec = deltaSec
       onMoveMultiClips(stepDelta)
+      return
+    }
+
+    if (drag.kind === 'video' && drag.mode === 'resize-left' && onResizeVideoClip) {
+      const origEnd = drag.origStart + drag.duration
+      const minStart = drag.origStart - drag.origSourceStart
+      const maxStart = origEnd - 0.1
+      const rawStart = Math.max(minStart, Math.min(maxStart, drag.origStart + deltaSec))
+      const snappedStart = Math.max(
+        minStart,
+        Math.min(maxStart, snapTime(rawStart, 'video', drag.id)),
+      )
+      const nextSourceStart = drag.origSourceStart + (snappedStart - drag.origStart)
+      onResizeVideoClip(
+        drag.id,
+        snappedStart,
+        origEnd - snappedStart,
+        nextSourceStart,
+      )
+      return
+    }
+
+    if (drag.kind === 'video' && drag.mode === 'resize-right' && onResizeVideoClip) {
+      const minEnd = drag.origStart + 0.1
+      const maxEnd =
+        drag.origStart + (drag.origSourceDuration - drag.origSourceStart)
+      const rawEnd = Math.max(
+        minEnd,
+        Math.min(maxEnd, drag.origStart + drag.duration + deltaSec),
+      )
+      const snappedEnd = Math.max(
+        minEnd,
+        Math.min(maxEnd, snapTime(rawEnd, 'video', drag.id)),
+      )
+      onResizeVideoClip(
+        drag.id,
+        drag.origStart,
+        snappedEnd - drag.origStart,
+        drag.origSourceStart,
+      )
       return
     }
 
@@ -429,10 +503,10 @@ export function Timeline({
               variant="outline"
               onClick={onAddDynamicText}
               className="h-7 px-2.5 text-xs border-amber-600/50 bg-zinc-900 hover:bg-amber-950/40 text-amber-200"
-              title="축소 트랜지션이 적용된 다이내믹 텍스트 추가"
+              title="축소·확대 트랜지션이 적용된 전체화면 텍스트 추가"
             >
               <Sparkles className="w-3.5 h-3.5 mr-1 text-amber-400" />
-              다이내믹 텍스트
+              전체화면 텍스트
             </Button>
           )}
 
@@ -508,27 +582,70 @@ export function Timeline({
       {/* Scrollable Tracks */}
       <div className="flex">
         {/* Track Labels */}
-        <div className="w-28 shrink-0 border-r border-zinc-800 bg-zinc-900/40 flex flex-col">
+        <div className="w-32 shrink-0 border-r border-zinc-800 bg-zinc-900/40 flex flex-col">
           <div className="h-7 border-b border-zinc-800 px-2 flex items-center text-[10px] font-mono text-zinc-500">
             {formatTimecode(playhead)}
           </div>
-          {displayedTextLayers.map((layerIdx) => (
-            <div
-              key={`text-label-${layerIdx}`}
-              className="h-9 border-b border-zinc-800/70 px-2.5 flex items-center gap-1.5 text-xs text-violet-300"
-            >
-              <Type className="w-3.5 h-3.5 shrink-0" />
-              <span className="truncate">
-                {textLayerCount > 1 ? `캡션 ${layerIdx + 1}` : '캡션'}
-              </span>
-            </div>
-          ))}
-          <div className="h-14 border-b border-zinc-800/70 px-2.5 flex items-center gap-1.5 text-xs text-sky-300">
+          {displayedTextLayers.map((layerIdx) => {
+            const isHidden = hiddenCaptionLayers.includes(layerIdx)
+            return (
+              <div
+                key={`text-label-${layerIdx}`}
+                onClick={() => onToggleTrackSelect?.('text', layerIdx)}
+                className={`h-9 border-b border-zinc-800/70 px-2 flex items-center gap-1.5 text-xs cursor-pointer hover:bg-zinc-800/40 ${
+                  isHidden ? 'text-zinc-500' : 'text-violet-300'
+                }`}
+                title="클릭하여 이 트랙의 모든 캡션 선택/해제"
+              >
+                <input
+                  type="checkbox"
+                  checked={!isHidden}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={() => onToggleCaptionLayerHidden?.(layerIdx)}
+                  className="h-3.5 w-3.5 accent-violet-500 cursor-pointer shrink-0"
+                  title="캡션 레이어 보이기/숨기기"
+                />
+                <Type className="w-3 h-3 shrink-0" />
+                <span className="truncate">
+                  {textLayerCount > 1 ? `캡션 ${layerIdx + 1}` : '캡션'}
+                </span>
+              </div>
+            )
+          })}
+          <div
+            onClick={() => onToggleTrackSelect?.('video')}
+            className={`h-14 border-b border-zinc-800/70 px-2 flex items-center gap-1.5 text-xs cursor-pointer hover:bg-zinc-800/40 ${
+              videoTrackHidden ? 'text-zinc-500' : 'text-sky-300'
+            }`}
+            title="클릭하여 모든 비디오 클립 선택/해제"
+          >
+            <input
+              type="checkbox"
+              checked={!videoTrackHidden}
+              onClick={(e) => e.stopPropagation()}
+              onChange={() => onToggleVideoTrackHidden?.()}
+              className="h-3.5 w-3.5 accent-sky-500 cursor-pointer shrink-0"
+              title="비디오 트랙 보이기/숨기기"
+            />
             <span className="w-2 h-2 rounded-full bg-sky-400 shrink-0" />
             <span className="truncate">비디오</span>
           </div>
-          <div className="h-11 px-2.5 flex items-center gap-1.5 text-xs text-emerald-300">
-            <Music className="w-3.5 h-3.5 shrink-0" />
+          <div
+            onClick={() => onToggleTrackSelect?.('music')}
+            className={`h-11 px-2 flex items-center gap-1.5 text-xs cursor-pointer hover:bg-zinc-800/40 ${
+              musicTrackMuted ? 'text-zinc-500' : 'text-emerald-300'
+            }`}
+            title="클릭하여 음악 트랙 선택/해제"
+          >
+            <input
+              type="checkbox"
+              checked={!musicTrackMuted}
+              onClick={(e) => e.stopPropagation()}
+              onChange={() => onToggleMusicTrackMuted?.()}
+              className="h-3.5 w-3.5 accent-emerald-500 cursor-pointer shrink-0"
+              title="음악 트랙 소리 켜기/끄기"
+            />
+            <Music className="w-3 h-3 shrink-0" />
             <span className="truncate">음악</span>
           </div>
         </div>
@@ -747,9 +864,10 @@ export function Timeline({
                 const width = Math.max(20, clip.duration * pxPerSec)
                 const asset = assets[clip.assetId]
                 return (
-                  <button
+                  <div
                     key={clip.id}
-                    type="button"
+                    role="button"
+                    tabIndex={0}
                     data-clip-kind="video"
                     data-clip-id={clip.id}
                     onPointerDown={(e) =>
@@ -759,19 +877,43 @@ export function Timeline({
                         clip.id,
                         clip.timelineStart,
                         clip.duration,
+                        0,
+                        'move',
+                        clip.sourceStart,
+                        clip.sourceDuration,
                       )
                     }
                     onPointerMove={moveClipDrag}
                     onPointerUp={endClipDrag}
                     onPointerCancel={endClipDrag}
                     style={{ left: `${left}px`, width: `${width}px` }}
-                    className={`absolute top-1.5 bottom-1.5 rounded px-2 flex flex-col justify-center text-left border transition-colors overflow-hidden cursor-grab active:cursor-grabbing ${
+                    className={`group absolute top-1.5 bottom-1.5 rounded px-2.5 flex flex-col justify-center text-left border transition-colors overflow-hidden cursor-grab active:cursor-grabbing ${
                       isSelected
                         ? 'bg-sky-600/35 border-sky-400 text-white ring-1 ring-sky-400/50'
                         : 'bg-sky-950/60 border-sky-800/70 text-sky-100 hover:border-sky-600'
                     }`}
                   >
-                    <div className="flex items-center gap-1.5 w-full">
+                    <div
+                      onPointerDown={(e) =>
+                        startClipDrag(
+                          e,
+                          'video',
+                          clip.id,
+                          clip.timelineStart,
+                          clip.duration,
+                          0,
+                          'resize-left',
+                          clip.sourceStart,
+                          clip.sourceDuration,
+                        )
+                      }
+                      onPointerMove={moveClipDrag}
+                      onPointerUp={endClipDrag}
+                      onPointerCancel={endClipDrag}
+                      className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-sky-400/50 rounded-l"
+                      title="왼쪽 경계 드래그로 시작/길이 조절"
+                    />
+                    <div className="flex items-center gap-1.5 w-full pointer-events-none">
                       {asset?.resolutionTag && (
                         <span className="shrink-0 rounded bg-sky-500/25 px-1 py-0.2 text-[9px] font-semibold text-sky-300">
                           {asset.resolutionTag}
@@ -781,10 +923,30 @@ export function Timeline({
                         {clip.name}
                       </span>
                     </div>
-                    <span className="text-[10px] font-mono text-sky-300/70">
+                    <span className="text-[10px] font-mono text-sky-300/70 pointer-events-none">
                       {clip.duration.toFixed(2)}s
                     </span>
-                  </button>
+                    <div
+                      onPointerDown={(e) =>
+                        startClipDrag(
+                          e,
+                          'video',
+                          clip.id,
+                          clip.timelineStart,
+                          clip.duration,
+                          0,
+                          'resize-right',
+                          clip.sourceStart,
+                          clip.sourceDuration,
+                        )
+                      }
+                      onPointerMove={moveClipDrag}
+                      onPointerUp={endClipDrag}
+                      onPointerCancel={endClipDrag}
+                      className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-sky-400/50 rounded-r"
+                      title="오른쪽 경계 드래그로 길이 조절"
+                    />
+                  </div>
                 )
               })}
             </div>
@@ -869,6 +1031,42 @@ export function Timeline({
               <div className="w-3 h-3 -ml-[5px] bg-rose-500 rotate-45 -mt-1 rounded-[1px]" />
             </div>
           </div>
+        </div>
+
+        {/* Premiere-style Narrow Stereo dB Meter */}
+        <div
+          className="w-9 shrink-0 border-l border-zinc-800 bg-zinc-950 px-1 py-1.5 flex flex-col items-center justify-between select-none"
+          title="오디오 출력 레벨 (dBFS)"
+        >
+          <span className="text-[9px] font-mono text-zinc-500 leading-none">
+            dB
+          </span>
+          <div className="flex-1 w-full flex items-stretch justify-center gap-1 my-1">
+            {([0, 1] as const).map((ch) => {
+              const db = Math.max(-60, Math.min(0, audioDb[ch]))
+              const pct = ((db + 60) / 60) * 100
+              return (
+                <div
+                  key={ch}
+                  className="relative w-2 h-full rounded-[2px] bg-zinc-900 border border-zinc-800 overflow-hidden"
+                >
+                  <div
+                    className="absolute bottom-0 left-0 right-0 transition-[height] duration-75"
+                    style={{
+                      height: `${pct}%`,
+                      background:
+                        'linear-gradient(to top, #22c55e 0%, #22c55e 68%, #eab308 82%, #ef4444 96%)',
+                    }}
+                  />
+                </div>
+              )
+            })}
+          </div>
+          <span className="text-[9px] font-mono text-zinc-400 leading-none">
+            {Math.max(audioDb[0], audioDb[1]) <= -59
+              ? '-∞'
+              : `${Math.round(Math.max(audioDb[0], audioDb[1]))}`}
+          </span>
         </div>
       </div>
     </div>
