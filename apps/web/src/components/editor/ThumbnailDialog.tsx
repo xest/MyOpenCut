@@ -11,6 +11,7 @@ import {
 } from '#/components/ui/dialog'
 import { Label } from '#/components/ui/label'
 import { Slider } from '#/components/ui/slider'
+import { saveFileInDirectory } from '#/editor/projectStorage'
 import { renderThumbnailFrame } from '#/editor/render'
 import {
   CANVAS_PRESETS,
@@ -41,6 +42,7 @@ interface ThumbnailDialogProps {
   videoElement: HTMLVideoElement | null
   videoClip: VideoClip | null
   activeTexts: TextClip[]
+  workspaceDirHandle?: FileSystemDirectoryHandle | null
 }
 
 const THUMB_PREFS_KEY = 'myopencut.thumbnail.prefs.v1'
@@ -53,8 +55,10 @@ export function ThumbnailDialog({
   videoElement,
   videoClip,
   activeTexts,
+  workspaceDirHandle = null,
 }: ThumbnailDialogProps) {
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const [savedNotice, setSavedNotice] = useState<string | null>(null)
   const [showSafeZone, setShowSafeZone] = useState(true)
   const [options, setOptions] = useState<ThumbnailOptions>({
     dimEnabled: false,
@@ -111,22 +115,29 @@ export function ThumbnailDialog({
 
   const preset = CANVAS_PRESETS[aspectRatio]
 
-  // Capture a snapshot of the video frame once when dialog opens so seeking/resizing stays instant
+  // Capture a snapshot of the video frame each time dialog opens (with rAF retry so portal canvas is mounted)
   const [frameBitmap, setFrameBitmap] = useState<HTMLCanvasElement | null>(null)
+  const [renderTick, setRenderTick] = useState(0)
 
   useEffect(() => {
     if (!open) return
     if (!videoElement || !videoClip || videoElement.readyState < 2) {
       setFrameBitmap(null)
-      return
+    } else {
+      const snap = document.createElement('canvas')
+      snap.width = videoElement.videoWidth || preset.width
+      snap.height = videoElement.videoHeight || preset.height
+      const sCtx = snap.getContext('2d')
+      if (sCtx) {
+        sCtx.drawImage(videoElement, 0, 0, snap.width, snap.height)
+        setFrameBitmap(snap)
+      }
     }
-    const snap = document.createElement('canvas')
-    snap.width = videoElement.videoWidth || preset.width
-    snap.height = videoElement.videoHeight || preset.height
-    const sCtx = snap.getContext('2d')
-    if (sCtx) {
-      sCtx.drawImage(videoElement, 0, 0, snap.width, snap.height)
-      setFrameBitmap(snap)
+    const raf1 = requestAnimationFrame(() => setRenderTick((t) => t + 1))
+    const timer = window.setTimeout(() => setRenderTick((t) => t + 1), 60)
+    return () => {
+      cancelAnimationFrame(raf1)
+      window.clearTimeout(timer)
     }
   }, [open, videoElement, videoClip, preset.width, preset.height])
 
@@ -147,17 +158,20 @@ export function ThumbnailDialog({
       videoElement: frameBitmap,
       videoClip,
       activeTexts,
+      currentTime: playhead,
       options,
       showSafeZone,
     })
   }, [
     open,
+    renderTick,
     preset.width,
     preset.height,
     aspectRatio,
     frameBitmap,
     videoClip,
     activeTexts,
+    playhead,
     options,
     showSafeZone,
   ])
@@ -177,18 +191,32 @@ export function ThumbnailDialog({
       videoElement: frameBitmap,
       videoClip,
       activeTexts,
+      currentTime: playhead,
       options,
       showSafeZone: false,
     })
 
     const mime = format === 'png' ? 'image/png' : 'image/jpeg'
+    const fileName = `thumbnail-${aspectRatio.replace(':', 'x')}-${playhead.toFixed(2)}s.${format}`
     outCanvas.toBlob(
-      (blob) => {
+      async (blob) => {
         if (!blob) return
+        if (workspaceDirHandle) {
+          const ok = await saveFileInDirectory(
+            workspaceDirHandle,
+            fileName,
+            blob,
+          )
+          if (ok) {
+            setSavedNotice(`작업 폴더에 저장됨: ${fileName}`)
+            window.setTimeout(() => setSavedNotice(null), 2200)
+            return
+          }
+        }
         const url = URL.createObjectURL(blob)
         const a = document.createElement('a')
         a.href = url
-        a.download = `thumbnail-${aspectRatio.replace(':', 'x')}-${playhead.toFixed(2)}s.${format}`
+        a.download = fileName
         a.click()
         URL.revokeObjectURL(url)
       },
@@ -216,20 +244,27 @@ export function ThumbnailDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-5xl max-h-[92vh] overflow-y-auto p-4 bg-zinc-950 border-zinc-800 text-zinc-100">
+      <DialogContent className="sm:max-w-[92vw] w-[1080px] max-h-[88vh] overflow-hidden p-4 bg-zinc-950 border-zinc-800 text-zinc-100">
         <DialogHeader className="pb-1">
-          <DialogTitle className="flex items-center gap-2 text-base">
-            <ImageIcon className="w-4 h-4 text-sky-400" />
-            현재 프레임 썸네일 ({playhead.toFixed(2)}초 · {preset.label})
+          <DialogTitle className="flex items-center justify-between gap-2 text-base">
+            <span className="flex items-center gap-2">
+              <ImageIcon className="w-4 h-4 text-sky-400" />
+              현재 프레임 썸네일 ({playhead.toFixed(2)}초 · {preset.label})
+            </span>
+            {savedNotice && (
+              <span className="rounded bg-emerald-950/70 border border-emerald-700/50 px-2 py-0.5 text-[11px] font-normal text-emerald-300">
+                {savedNotice}
+              </span>
+            )}
           </DialogTitle>
         </DialogHeader>
 
         <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-start">
           {/* Preview */}
-          <div className="md:col-span-6 flex flex-col items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900/70 p-2.5">
+          <div className="md:col-span-6 flex flex-col items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900/70 p-3">
             <canvas
               ref={previewCanvasRef}
-              className="max-h-[54vh] max-w-full rounded shadow-lg border border-zinc-800 object-contain"
+              className="max-h-[56vh] max-w-full rounded shadow-lg border border-zinc-800 object-contain"
               style={{
                 aspectRatio: `${preset.width} / ${preset.height}`,
               }}
@@ -250,7 +285,7 @@ export function ThumbnailDialog({
           </div>
 
           {/* Controls */}
-          <div className="md:col-span-6 space-y-2.5">
+          <div className="md:col-span-6 space-y-2.5 max-h-[72vh] overflow-y-auto pr-1">
             {/* Dim Option */}
             <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-2.5 space-y-2">
               <div className="flex items-center justify-between">

@@ -367,6 +367,7 @@ export function renderThumbnailFrame(params: {
   videoElement: HTMLVideoElement | HTMLCanvasElement | ImageBitmap | null
   videoClip: VideoClip | null
   activeTexts: TextClip[]
+  currentTime?: number
   options: ThumbnailOptions
   showSafeZone?: boolean
 }) {
@@ -378,6 +379,7 @@ export function renderThumbnailFrame(params: {
     videoElement,
     videoClip,
     activeTexts,
+    currentTime,
     options,
     showSafeZone,
   } = params
@@ -393,7 +395,7 @@ export function renderThumbnailFrame(params: {
   // If NOT replacing text, keep original active timeline captions
   if (!options.overrideTextEnabled) {
     for (const textClip of activeTexts) {
-      drawTextClip(ctx, width, height, textClip)
+      drawTextClip(ctx, width, height, textClip, currentTime)
     }
   }
 
