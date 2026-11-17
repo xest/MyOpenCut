@@ -335,6 +335,7 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
         videoElement: videoEl,
         videoClip: activeClip,
         activeTexts,
+        currentTime: time,
         showSafeZone: false,
       })
 

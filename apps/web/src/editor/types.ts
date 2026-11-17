@@ -71,6 +71,12 @@ export interface TextClip {
   x: number // 0..1 normalized
   y: number // 0..1 normalized
   align: 'left' | 'center' | 'right'
+  isDynamic?: boolean
+  transition?: 'none' | 'shrink' | 'grow'
+  transitionDuration?: number // seconds, default 0.35
+  transitionStartPos?: NineGridPosition
+  transitionEndPos?: NineGridPosition
+  transitionEndBehavior?: 'stay' | 'fade-out'
 }
 
 export interface MusicClip {

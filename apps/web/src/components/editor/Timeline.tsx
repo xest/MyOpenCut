@@ -1,10 +1,11 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   ArrowLeftToLine,
   ArrowRightToLine,
   Music,
   Scissors,
   Space,
+  Sparkles,
   Trash2,
   Type,
   ZoomIn,
@@ -32,12 +33,17 @@ interface TimelineProps {
   musicClip: MusicClip | null
   assets: Record<string, MediaAsset>
   selection: SelectionTarget
+  multiSelection?: { videoIds: string[]; textIds: string[] }
   onSelect: (target: SelectionTarget) => void
+  onToggleMultiSelect?: (target: { kind: 'video' | 'text'; id: string }) => void
+  onMarqueeSelect?: (sel: { videoIds: string[]; textIds: string[] }) => void
+  onMoveMultiClips?: (deltaSec: number) => void
   onTrimLeft: () => void
   onTrimRight: () => void
   onSplit: () => void
   onRemoveGaps: () => void
   onAddText: () => void
+  onAddDynamicText?: () => void
   onDeleteSelected: () => void
   onBeginDrag?: () => void
   onMoveVideoClip: (id: string, nextStart: number) => void
@@ -58,12 +64,17 @@ export function Timeline({
   musicClip,
   assets,
   selection,
+  multiSelection,
   onSelect,
+  onToggleMultiSelect,
+  onMarqueeSelect,
+  onMoveMultiClips,
   onTrimLeft,
   onTrimRight,
   onSplit,
   onRemoveGaps,
   onAddText,
+  onAddDynamicText,
   onDeleteSelected,
   onBeginDrag,
   onMoveVideoClip,
@@ -73,6 +84,21 @@ export function Timeline({
   onDuplicateTextClip,
 }: TimelineProps) {
   const tracksRef = useRef<HTMLDivElement | null>(null)
+  const tracksAreaRef = useRef<HTMLDivElement | null>(null)
+  const marqueeRef = useRef<{
+    startClientX: number
+    startClientY: number
+    startLocalX: number
+    startLocalY: number
+    hasMoved: boolean
+  } | null>(null)
+  const [marqueeBox, setMarqueeBox] = useState<{
+    left: number
+    top: number
+    width: number
+    height: number
+  } | null>(null)
+  const [snapLineTime, setSnapLineTime] = useState<number | null>(null)
   const dragRef = useRef<{
     kind: 'video' | 'text'
     mode: 'move' | 'resize-left' | 'resize-right'
@@ -83,6 +109,7 @@ export function Timeline({
     origLayer: number
     duration: number
     altCopy: boolean
+    lastDeltaSec: number
     hasMoved: boolean
   } | null>(null)
   const textLayerCount = Math.max(
@@ -165,30 +192,35 @@ export function Timeline({
 
   const snapTime = (rawTime: number, kind: 'video' | 'text', id: string) => {
     const clamped = Math.max(0, rawTime)
-    const snapThreshold = 8 / pxPerSec
+    const snapThreshold = 12 / pxPerSec
     const targets = [0, playhead]
-    if (kind === 'video') {
-      for (const c of videoClips) {
-        if (c.id === id) continue
-        targets.push(c.timelineStart, c.timelineStart + c.duration)
-      }
-    } else {
-      for (const t of textClips) {
-        if (t.id === id) continue
-        targets.push(t.timelineStart, t.timelineStart + t.duration)
-      }
+    for (const c of videoClips) {
+      if (kind === 'video' && c.id === id) continue
+      targets.push(c.timelineStart, c.timelineStart + c.duration)
+    }
+    for (const t of textClips) {
+      if (kind === 'text' && t.id === id) continue
+      targets.push(t.timelineStart, t.timelineStart + t.duration)
     }
     let best = clamped
     let bestDist = snapThreshold
+    let snapped = false
     for (const target of targets) {
       const dist = Math.abs(clamped - target)
       if (dist < bestDist) {
         best = target
         bestDist = dist
+        snapped = true
       }
     }
+    setSnapLineTime(snapped ? best : null)
     return best
   }
+
+  const isClipInMulti = (kind: 'video' | 'text', id: string) =>
+    kind === 'video'
+      ? Boolean(multiSelection?.videoIds.includes(id))
+      : Boolean(multiSelection?.textIds.includes(id))
 
   const startClipDrag = (
     e: React.PointerEvent<HTMLElement>,
@@ -200,7 +232,13 @@ export function Timeline({
     mode: 'move' | 'resize-left' | 'resize-right' = 'move',
   ) => {
     e.stopPropagation()
-    onSelect({ kind, id })
+    if (e.shiftKey && mode === 'move' && onToggleMultiSelect) {
+      onToggleMultiSelect({ kind, id })
+      return
+    }
+    if (!isClipInMulti(kind, id)) {
+      onSelect({ kind, id })
+    }
     dragRef.current = {
       kind,
       mode,
@@ -211,6 +249,7 @@ export function Timeline({
       origLayer,
       duration,
       altCopy: mode === 'move' && e.altKey,
+      lastDeltaSec: 0,
       hasMoved: false,
     }
     e.currentTarget.setPointerCapture(e.pointerId)
@@ -241,6 +280,21 @@ export function Timeline({
     }
 
     const deltaSec = (e.clientX - drag.startX) / pxPerSec
+
+    if (
+      drag.mode === 'move' &&
+      !drag.altCopy &&
+      isClipInMulti(drag.kind, drag.id) &&
+      onMoveMultiClips &&
+      (multiSelection?.videoIds.length ?? 0) +
+        (multiSelection?.textIds.length ?? 0) >
+        1
+    ) {
+      const stepDelta = deltaSec - drag.lastDeltaSec
+      drag.lastDeltaSec = deltaSec
+      onMoveMultiClips(stepDelta)
+      return
+    }
 
     if (drag.kind === 'text' && drag.mode === 'resize-left') {
       const origEnd = drag.origStart + drag.duration
@@ -281,6 +335,7 @@ export function Timeline({
 
   const endClipDrag = () => {
     dragRef.current = null
+    setSnapLineTime(null)
   }
 
   const rulerStep =
@@ -362,16 +417,35 @@ export function Timeline({
             variant="outline"
             onClick={onAddText}
             className="h-7 px-2.5 text-xs border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-100"
+            title="캡션 추가 (단축키: T)"
           >
             <Type className="w-3.5 h-3.5 mr-1 text-violet-400" />
-            텍스트/캡션 추가
+            캡션 추가
           </Button>
+          {onAddDynamicText && (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={onAddDynamicText}
+              className="h-7 px-2.5 text-xs border-amber-600/50 bg-zinc-900 hover:bg-amber-950/40 text-amber-200"
+              title="축소 트랜지션이 적용된 다이내믹 텍스트 추가"
+            >
+              <Sparkles className="w-3.5 h-3.5 mr-1 text-amber-400" />
+              다이내믹 텍스트
+            </Button>
+          )}
 
           <Button
             type="button"
             size="sm"
             variant="ghost"
-            disabled={!selection}
+            disabled={
+              !selection &&
+              (multiSelection?.videoIds.length ?? 0) +
+                (multiSelection?.textIds.length ?? 0) ===
+                0
+            }
             onClick={onDeleteSelected}
             className="h-7 px-2 text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-950/40"
             title="선택한 클립 삭제 (Delete)"
@@ -445,7 +519,7 @@ export function Timeline({
             >
               <Type className="w-3.5 h-3.5 shrink-0" />
               <span className="truncate">
-                {textLayerCount > 1 ? `텍스트 ${layerIdx + 1}` : '텍스트'}
+                {textLayerCount > 1 ? `캡션 ${layerIdx + 1}` : '캡션'}
               </span>
             </div>
           ))}
@@ -485,20 +559,102 @@ export function Timeline({
               ))}
             </div>
 
-            {/* Text / Caption Multi-Layer Tracks */}
+            {/* Marquee-selectable Tracks Wrapper (Captions + Video) */}
+            <div
+              ref={tracksAreaRef}
+              className="relative"
+              onPointerDown={(e) => {
+                if (e.button !== 0) return
+                const area = tracksAreaRef.current
+                if (!area) return
+                const rect = area.getBoundingClientRect()
+                marqueeRef.current = {
+                  startClientX: e.clientX,
+                  startClientY: e.clientY,
+                  startLocalX: e.clientX - rect.left,
+                  startLocalY: e.clientY - rect.top,
+                  hasMoved: false,
+                }
+                area.setPointerCapture(e.pointerId)
+              }}
+              onPointerMove={(e) => {
+                const m = marqueeRef.current
+                const area = tracksAreaRef.current
+                if (!m || !area || e.buttons !== 1) return
+                const dx = e.clientX - m.startClientX
+                const dy = e.clientY - m.startClientY
+                if (!m.hasMoved) {
+                  if (Math.hypot(dx, dy) < 5) return
+                  m.hasMoved = true
+                }
+                const rect = area.getBoundingClientRect()
+                const curLocalX = Math.max(
+                  0,
+                  Math.min(rect.width, e.clientX - rect.left),
+                )
+                const curLocalY = Math.max(
+                  0,
+                  Math.min(rect.height, e.clientY - rect.top),
+                )
+                const left = Math.min(m.startLocalX, curLocalX)
+                const top = Math.min(m.startLocalY, curLocalY)
+                const width = Math.abs(curLocalX - m.startLocalX)
+                const height = Math.abs(curLocalY - m.startLocalY)
+                setMarqueeBox({ left, top, width, height })
+
+                const selRect = {
+                  left: rect.left + left,
+                  right: rect.left + left + width,
+                  top: rect.top + top,
+                  bottom: rect.top + top + height,
+                }
+                const videoIds: string[] = []
+                const textIds: string[] = []
+                const nodes = area.querySelectorAll<HTMLElement>(
+                  '[data-clip-kind][data-clip-id]',
+                )
+                nodes.forEach((node) => {
+                  const r = node.getBoundingClientRect()
+                  const intersects =
+                    r.left <= selRect.right &&
+                    r.right >= selRect.left &&
+                    r.top <= selRect.bottom &&
+                    r.bottom >= selRect.top
+                  if (!intersects) return
+                  const kind = node.dataset.clipKind
+                  const id = node.dataset.clipId
+                  if (!id) return
+                  if (kind === 'video') videoIds.push(id)
+                  if (kind === 'text') textIds.push(id)
+                })
+                onMarqueeSelect?.({ videoIds, textIds })
+              }}
+              onPointerUp={(e) => {
+                const m = marqueeRef.current
+                marqueeRef.current = null
+                setMarqueeBox(null)
+                if (m && !m.hasMoved) {
+                  onMarqueeSelect?.({ videoIds: [], textIds: [] })
+                  handleScrub(e.clientX)
+                }
+              }}
+              onPointerCancel={() => {
+                marqueeRef.current = null
+                setMarqueeBox(null)
+              }}
+            >
+            {/* Caption Multi-Layer Tracks */}
             {displayedTextLayers.map((layerIdx) => (
               <div
                 key={`text-track-${layerIdx}`}
                 className="relative h-9 border-b border-zinc-800/70 bg-zinc-950/80"
-                onClick={(e) => {
-                  if (e.target === e.currentTarget) handleScrub(e.clientX)
-                }}
               >
                 {textClips
                   .filter((t) => (t.layer ?? 0) === layerIdx)
                   .map((t) => {
                     const isSelected =
-                      selection?.kind === 'text' && selection.id === t.id
+                      (selection?.kind === 'text' && selection.id === t.id) ||
+                      isClipInMulti('text', t.id)
                     const left = t.timelineStart * pxPerSec
                     const width = Math.max(24, t.duration * pxPerSec)
                     return (
@@ -506,6 +662,8 @@ export function Timeline({
                         key={t.id}
                         role="button"
                         tabIndex={0}
+                        data-clip-kind="text"
+                        data-clip-id={t.id}
                         onPointerDown={(e) =>
                           startClipDrag(
                             e,
@@ -523,8 +681,12 @@ export function Timeline({
                         style={{ left: `${left}px`, width: `${width}px` }}
                         className={`group absolute top-1 bottom-1 rounded px-2.5 flex items-center text-left text-xs truncate border transition-colors cursor-grab active:cursor-grabbing ${
                           isSelected
-                            ? 'bg-violet-600/40 border-violet-400 text-white'
-                            : 'bg-violet-950/60 border-violet-700/60 text-violet-200 hover:border-violet-500'
+                            ? t.isDynamic
+                              ? 'bg-amber-600/40 border-amber-400 text-white ring-1 ring-amber-400/50'
+                              : 'bg-violet-600/40 border-violet-400 text-white ring-1 ring-violet-400/50'
+                            : t.isDynamic
+                              ? 'bg-amber-950/60 border-amber-700/60 text-amber-200 hover:border-amber-500'
+                              : 'bg-violet-950/60 border-violet-700/60 text-violet-200 hover:border-violet-500'
                         }`}
                       >
                         <div
@@ -545,8 +707,11 @@ export function Timeline({
                           className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-violet-400/50 rounded-l"
                           title="왼쪽 경계 드래그로 시작/길이 조절"
                         />
-                        <span className="truncate pointer-events-none">
-                          {t.text || '(빈 텍스트)'}
+                        <span className="truncate pointer-events-none flex items-center gap-1">
+                          {t.isDynamic && (
+                            <Sparkles className="w-3 h-3 text-amber-300 shrink-0" />
+                          )}
+                          {t.text || '(빈 캡션)'}
                         </span>
                         <div
                           onPointerDown={(e) =>
@@ -573,15 +738,11 @@ export function Timeline({
             ))}
 
             {/* Video Track */}
-            <div
-              className="relative h-14 border-b border-zinc-800/70 bg-zinc-950"
-              onClick={(e) => {
-                if (e.target === e.currentTarget) handleScrub(e.clientX)
-              }}
-            >
+            <div className="relative h-14 border-b border-zinc-800/70 bg-zinc-950">
               {videoClips.map((clip) => {
                 const isSelected =
-                  selection?.kind === 'video' && selection.id === clip.id
+                  (selection?.kind === 'video' && selection.id === clip.id) ||
+                  isClipInMulti('video', clip.id)
                 const left = clip.timelineStart * pxPerSec
                 const width = Math.max(20, clip.duration * pxPerSec)
                 const asset = assets[clip.assetId]
@@ -589,6 +750,8 @@ export function Timeline({
                   <button
                     key={clip.id}
                     type="button"
+                    data-clip-kind="video"
+                    data-clip-id={clip.id}
                     onPointerDown={(e) =>
                       startClipDrag(
                         e,
@@ -624,6 +787,26 @@ export function Timeline({
                   </button>
                 )
               })}
+            </div>
+
+            {snapLineTime !== null && (
+              <div
+                className="pointer-events-none absolute top-0 bottom-0 z-30 w-px bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.9)]"
+                style={{ left: `${snapLineTime * pxPerSec}px` }}
+              />
+            )}
+
+            {marqueeBox && (
+              <div
+                className="pointer-events-none absolute z-30 border border-sky-400 bg-sky-400/15 rounded-[2px]"
+                style={{
+                  left: `${marqueeBox.left}px`,
+                  top: `${marqueeBox.top}px`,
+                  width: `${marqueeBox.width}px`,
+                  height: `${marqueeBox.height}px`,
+                }}
+              />
+            )}
             </div>
 
             {/* Music Track (spans total video duration with fade-in/out visualization) */}

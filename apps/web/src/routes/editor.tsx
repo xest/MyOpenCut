@@ -74,6 +74,7 @@ import {
   type AspectRatio,
   type MediaAsset,
   type MusicClip,
+  type NineGridPosition,
   type SelectionTarget,
   type TextClip,
   type VideoClip,
@@ -81,6 +82,21 @@ import {
 import { useMusicPlayer } from '#/editor/useMusicPlayer'
 
 export const Route = createFileRoute('/editor')({ component: Editor })
+
+const NINE_GRID_POSITIONS: { id: NineGridPosition; label: string }[] = [
+  { id: 'top-left', label: '좌상' },
+  { id: 'top-center', label: '상' },
+  { id: 'top-right', label: '우상' },
+  { id: 'middle-left', label: '좌' },
+  { id: 'center', label: '중' },
+  { id: 'middle-right', label: '우' },
+  { id: 'bottom-left', label: '좌하' },
+  { id: 'bottom-center', label: '하' },
+  { id: 'bottom-right', label: '우하' },
+]
+
+// Temporarily hidden from UI until STFT/ONNX inference moves into a Web Worker
+const ENABLE_AI_MUSIC_REMOVAL_UI = false
 
 let idCounter = 1
 function nextId(prefix: string) {
@@ -136,6 +152,10 @@ function Editor() {
   const [musicClip, setMusicClip] = useState<MusicClip | null>(null)
 
   const [selection, setSelection] = useState<SelectionTarget>(null)
+  const [multiSelection, setMultiSelection] = useState<{
+    videoIds: string[]
+    textIds: string[]
+  }>({ videoIds: [], textIds: [] })
   const [playhead, setPlayhead] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
   const [pxPerSec, setPxPerSec] = useState(50)
@@ -233,6 +253,12 @@ function Editor() {
   const clipboardRef = useRef<
     | { kind: 'video'; clip: VideoClip }
     | { kind: 'text'; clip: TextClip }
+    | {
+        kind: 'multi'
+        videos: VideoClip[]
+        texts: TextClip[]
+        baseStart: number
+      }
     | null
   >(null)
   const [isFullscreen, setIsFullscreen] = useState(false)
@@ -694,9 +720,9 @@ function Editor() {
     ctx.clearRect(0, 0, previewW, previewH)
 
     for (const textClip of activeTextClips) {
-      drawTextClip(ctx, previewW, previewH, textClip)
+      drawTextClip(ctx, previewW, previewH, textClip, playhead)
     }
-  }, [aspectRatio, activeTextClips])
+  }, [aspectRatio, activeTextClips, playhead])
 
   const drawPreviewRef = useRef(drawPreview)
   drawPreviewRef.current = drawPreview
@@ -970,6 +996,23 @@ function Editor() {
   }, [videoClips, textClips, pushHistory])
 
   const handleCopySelected = useCallback(() => {
+    const multiCount =
+      multiSelection.videoIds.length + multiSelection.textIds.length
+    if (multiCount > 1) {
+      const videos = videoClips
+        .filter((c) => multiSelection.videoIds.includes(c.id))
+        .map((c) => ({ ...c }))
+      const texts = textClips
+        .filter((t) => multiSelection.textIds.includes(t.id))
+        .map((t) => ({ ...t, charColors: { ...t.charColors } }))
+      const allStarts = [
+        ...videos.map((v) => v.timelineStart),
+        ...texts.map((t) => t.timelineStart),
+      ]
+      const baseStart = allStarts.length > 0 ? Math.min(...allStarts) : 0
+      clipboardRef.current = { kind: 'multi', videos, texts, baseStart }
+      return
+    }
     if (selection?.kind === 'video') {
       const found = videoClips.find((c) => c.id === selection.id)
       if (found) clipboardRef.current = { kind: 'video', clip: { ...found } }
@@ -982,12 +1025,50 @@ function Editor() {
         }
       }
     }
-  }, [selection, videoClips, textClips])
+  }, [selection, multiSelection, videoClips, textClips])
 
   const handlePasteAtPlayhead = useCallback(() => {
     const copied = clipboardRef.current
     if (!copied) return
     pushHistory()
+    if (copied.kind === 'multi') {
+      const newVideoIds: string[] = []
+      const newTextIds: string[] = []
+      const addedVideos: VideoClip[] = copied.videos.map((v) => {
+        const id = nextId('vclip')
+        newVideoIds.push(id)
+        return {
+          ...v,
+          id,
+          timelineStart: Math.max(0, playhead + (v.timelineStart - copied.baseStart)),
+        }
+      })
+      const workingTexts = [...textClips]
+      const addedTexts: TextClip[] = copied.texts.map((t) => {
+        const id = nextId('text')
+        newTextIds.push(id)
+        const start = Math.max(0, playhead + (t.timelineStart - copied.baseStart))
+        const layer = findFreeTextLayer(workingTexts, start, t.duration)
+        const cloned: TextClip = {
+          ...t,
+          id,
+          timelineStart: start,
+          layer,
+          charColors: { ...t.charColors },
+        }
+        workingTexts.push(cloned)
+        return cloned
+      })
+      if (addedVideos.length > 0) {
+        setVideoClips((prev) => [...prev, ...addedVideos])
+      }
+      if (addedTexts.length > 0) {
+        setTextClips((prev) => [...prev, ...addedTexts])
+      }
+      setSelection(null)
+      setMultiSelection({ videoIds: newVideoIds, textIds: newTextIds })
+      return
+    }
     if (copied.kind === 'video') {
       const id = nextId('vclip')
       const cloned: VideoClip = {
@@ -997,6 +1078,7 @@ function Editor() {
       }
       setVideoClips((prev) => [...prev, cloned])
       setSelection({ kind: 'video', id })
+      setMultiSelection({ videoIds: [], textIds: [] })
     } else {
       const id = nextId('text')
       const layer = findFreeTextLayer(
@@ -1013,6 +1095,7 @@ function Editor() {
       }
       setTextClips((prev) => [...prev, cloned])
       setSelection({ kind: 'text', id })
+      setMultiSelection({ videoIds: [], textIds: [] })
     }
   }, [playhead, textClips, pushHistory])
 
@@ -1051,7 +1134,7 @@ function Editor() {
     const topY = aspectRatio === '9:16' ? 0.16 : 0.13
     const newText: TextClip = {
       id,
-      text: '텍스트를 입력하세요',
+      text: '캡션을 입력하세요',
       defaultColor: '#FFFFFF',
       charColors: {},
       fontSize: 64,
@@ -1065,12 +1148,145 @@ function Editor() {
       x: 0.5,
       y: Math.max(topY, bottomY - layer * 0.14),
       align: 'center',
+      transition: 'none',
     }
     setTextClips((prev) => [...prev, newText])
     setSelection({ kind: 'text', id })
+    setMultiSelection({ videoIds: [], textIds: [] })
   }, [playhead, activeVideoClip, textClips, aspectRatio, pushHistory])
 
+  const handleAddDynamicText = useCallback(() => {
+    pushHistory()
+    const id = nextId('text')
+    const timelineStart = activeVideoClip ? activeVideoClip.timelineStart : playhead
+    const duration = activeVideoClip ? activeVideoClip.duration : 3
+    const layer = findFreeTextLayer(textClips, timelineStart, duration)
+    const defaultSize = aspectRatio === '9:16' ? 140 : 180
+    const newText: TextClip = {
+      id,
+      text: '다이내믹 텍스트',
+      defaultColor: '#FFFFFF',
+      charColors: {},
+      fontSize: defaultSize,
+      fontWeight: 800,
+      strokeColor: '#000000',
+      strokeWidth: Number((defaultSize * 0.1).toFixed(1)),
+      backgroundColor: '',
+      timelineStart,
+      duration,
+      layer,
+      x: 0.5,
+      y: 0.5,
+      align: 'center',
+      isDynamic: true,
+      transition: 'shrink',
+      transitionDuration: 0.35,
+      transitionStartPos: 'center',
+      transitionEndPos: 'center',
+      transitionEndBehavior: 'stay',
+    }
+    setTextClips((prev) => [...prev, newText])
+    setSelection({ kind: 'text', id })
+    setMultiSelection({ videoIds: [], textIds: [] })
+  }, [playhead, activeVideoClip, textClips, aspectRatio, pushHistory])
+
+  const handleMarqueeSelect = useCallback(
+    (sel: { videoIds: string[]; textIds: string[] }) => {
+      setMultiSelection(sel)
+      const total = sel.videoIds.length + sel.textIds.length
+      if (total === 1) {
+        if (sel.videoIds.length === 1) {
+          setSelection({ kind: 'video', id: sel.videoIds[0] })
+        } else {
+          setSelection({ kind: 'text', id: sel.textIds[0] })
+        }
+      } else {
+        setSelection(null)
+      }
+    },
+    [],
+  )
+
+  const handleToggleMultiSelect = useCallback(
+    (target: { kind: 'video' | 'text'; id: string }) => {
+      setMultiSelection((prev) => {
+        const videoSet = new Set(prev.videoIds)
+        const textSet = new Set(prev.textIds)
+        if (videoSet.size + textSet.size === 0 && selection) {
+          if (selection.kind === 'video') videoSet.add(selection.id)
+          if (selection.kind === 'text') textSet.add(selection.id)
+        }
+        if (target.kind === 'video') {
+          if (videoSet.has(target.id)) videoSet.delete(target.id)
+          else videoSet.add(target.id)
+        } else {
+          if (textSet.has(target.id)) textSet.delete(target.id)
+          else textSet.add(target.id)
+        }
+        const next = {
+          videoIds: Array.from(videoSet),
+          textIds: Array.from(textSet),
+        }
+        const total = next.videoIds.length + next.textIds.length
+        if (total === 1) {
+          setSelection(
+            next.videoIds.length === 1
+              ? { kind: 'video', id: next.videoIds[0] }
+              : { kind: 'text', id: next.textIds[0] },
+          )
+        } else {
+          setSelection(null)
+        }
+        return next
+      })
+    },
+    [selection],
+  )
+
+  const handleMoveMultiClips = useCallback(
+    (stepDelta: number) => {
+      if (Math.abs(stepDelta) < 1e-6) return
+      const vSet = new Set(multiSelection.videoIds)
+      const tSet = new Set(multiSelection.textIds)
+      if (vSet.size > 0) {
+        setVideoClips((prev) =>
+          prev.map((c) =>
+            vSet.has(c.id)
+              ? { ...c, timelineStart: Math.max(0, c.timelineStart + stepDelta) }
+              : c,
+          ),
+        )
+      }
+      if (tSet.size > 0) {
+        setTextClips((prev) =>
+          prev.map((t) =>
+            tSet.has(t.id)
+              ? { ...t, timelineStart: Math.max(0, t.timelineStart + stepDelta) }
+              : t,
+          ),
+        )
+      }
+    },
+    [multiSelection],
+  )
+
   const handleDeleteSelected = useCallback(() => {
+    const multiTotal =
+      multiSelection.videoIds.length + multiSelection.textIds.length
+    if (multiTotal > 0) {
+      pushHistory()
+      const vSet = new Set(multiSelection.videoIds)
+      const tSet = new Set(multiSelection.textIds)
+      if (vSet.size > 0) {
+        setVideoClips((prev) => prev.filter((c) => !vSet.has(c.id)))
+      }
+      if (tSet.size > 0) {
+        setTextClips((prev) => prev.filter((t) => !tSet.has(t.id)))
+      }
+      setMultiSelection({ videoIds: [], textIds: [] })
+      setSelection(null)
+      return
+    }
     if (!selection) return
     pushHistory()
     if (selection.kind === 'video') {
@@ -1081,7 +1297,7 @@ function Editor() {
       setMusicClip(null)
     }
     setSelection(null)
-  }, [selection, pushHistory])
+  }, [selection, multiSelection, pushHistory])
 
   const togglePlay = useCallback(() => {
     if (isPlaying) {
@@ -2020,6 +2236,274 @@ function Editor() {
               </Button>
             </div>
             <div className="flex-1 overflow-y-auto p-3.5 space-y-5">
+          {/* Multi-Selection Batch Edit Inspector */}
+          {multiSelection.videoIds.length + multiSelection.textIds.length > 1 && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-sky-400">
+                  다중 선택 일괄 수정
+                </h3>
+                <span className="text-[11px] font-mono text-zinc-400">
+                  비디오 {multiSelection.videoIds.length} · 캡션{' '}
+                  {multiSelection.textIds.length}
+                </span>
+              </div>
+
+              {multiSelection.videoIds.length > 0 && (
+                <div className="space-y-3 rounded-md border border-sky-800/50 bg-sky-950/20 p-2.5">
+                  <div className="text-[11px] font-semibold text-sky-300">
+                    선택된 비디오 ({multiSelection.videoIds.length}개)
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="outline"
+                      className="border-zinc-700 text-zinc-200 text-[11px]"
+                      onClick={() => {
+                        pushHistory()
+                        const vSet = new Set(multiSelection.videoIds)
+                        setVideoClips((prev) =>
+                          prev.map((c) =>
+                            vSet.has(c.id) ? { ...c, fitMode: 'cover' } : c,
+                          ),
+                        )
+                      }}
+                    >
+                      전체 꽉 채우기
+                    </Button>
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="outline"
+                      className="border-zinc-700 text-zinc-200 text-[11px]"
+                      onClick={() => {
+                        pushHistory()
+                        const vSet = new Set(multiSelection.videoIds)
+                        setVideoClips((prev) =>
+                          prev.map((c) =>
+                            vSet.has(c.id) ? { ...c, fitMode: 'contain' } : c,
+                          ),
+                        )
+                      }}
+                    >
+                      전체 원본 비율
+                    </Button>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs text-zinc-300">일괄 음소거</Label>
+                    <div className="flex gap-1">
+                      <Button
+                        type="button"
+                        size="xs"
+                        variant="outline"
+                        className="h-6 text-[11px] border-zinc-700"
+                        onClick={() => {
+                          pushHistory()
+                          const vSet = new Set(multiSelection.videoIds)
+                          setVideoClips((prev) =>
+                            prev.map((c) =>
+                              vSet.has(c.id) ? { ...c, muted: true } : c,
+                            ),
+                          )
+                        }}
+                      >
+                        음소거 ON
+                      </Button>
+                      <Button
+                        type="button"
+                        size="xs"
+                        variant="outline"
+                        className="h-6 text-[11px] border-zinc-700"
+                        onClick={() => {
+                          pushHistory()
+                          const vSet = new Set(multiSelection.videoIds)
+                          setVideoClips((prev) =>
+                            prev.map((c) =>
+                              vSet.has(c.id) ? { ...c, muted: false } : c,
+                            ),
+                          )
+                        }}
+                      >
+                        해제
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {multiSelection.textIds.length > 0 && (
+                <div className="space-y-3 rounded-md border border-violet-800/50 bg-violet-950/20 p-2.5">
+                  <div className="text-[11px] font-semibold text-violet-300">
+                    선택된 캡션 ({multiSelection.textIds.length}개)
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-xs text-zinc-300">
+                      <span>일괄 글자 크기</span>
+                      <input
+                        type="number"
+                        min={12}
+                        max={300}
+                        step={2}
+                        defaultValue={64}
+                        onBlur={(e) => {
+                          const raw = Number(e.target.value)
+                          if (!Number.isFinite(raw)) return
+                          const val = Math.max(12, Math.min(300, raw))
+                          pushHistory()
+                          const tSet = new Set(multiSelection.textIds)
+                          setTextClips((prev) =>
+                            prev.map((t) =>
+                              tSet.has(t.id)
+                                ? {
+                                    ...t,
+                                    fontSize: val,
+                                    strokeWidth: Number((val * 0.1).toFixed(1)),
+                                  }
+                                : t,
+                            ),
+                          )
+                        }}
+                        className="w-16 h-6 rounded bg-zinc-900 border border-zinc-700 px-1.5 text-right font-mono text-xs text-zinc-100"
+                      />
+                    </div>
+                    <Slider
+                      min={24}
+                      max={200}
+                      step={2}
+                      defaultValue={[64]}
+                      onValueChange={(raw) => {
+                        const val = Array.isArray(raw) ? raw[0] : raw
+                        const tSet = new Set(multiSelection.textIds)
+                        setTextClips((prev) =>
+                          prev.map((t) =>
+                            tSet.has(t.id)
+                              ? {
+                                  ...t,
+                                  fontSize: val,
+                                  strokeWidth: Number((val * 0.1).toFixed(1)),
+                                }
+                              : t,
+                          ),
+                        )
+                      }}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="flex items-center gap-1.5 text-xs text-zinc-300">
+                      기본 글자색
+                      <input
+                        type="color"
+                        defaultValue="#FFFFFF"
+                        onChange={(e) => {
+                          const tSet = new Set(multiSelection.textIds)
+                          const val = e.target.value
+                          setTextClips((prev) =>
+                            prev.map((t) =>
+                              tSet.has(t.id) ? { ...t, defaultColor: val } : t,
+                            ),
+                          )
+                        }}
+                        className="w-5 h-5 rounded bg-transparent cursor-pointer"
+                      />
+                    </label>
+                    <label className="flex items-center gap-1.5 text-xs text-zinc-300">
+                      외곽선
+                      <input
+                        type="color"
+                        defaultValue="#000000"
+                        onChange={(e) => {
+                          const tSet = new Set(multiSelection.textIds)
+                          const val = e.target.value
+                          setTextClips((prev) =>
+                            prev.map((t) =>
+                              tSet.has(t.id) ? { ...t, strokeColor: val } : t,
+                            ),
+                          )
+                        }}
+                        className="w-5 h-5 rounded bg-transparent cursor-pointer"
+                      />
+                    </label>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <div className="grid grid-cols-3 gap-1">
+                      {(
+                        [
+                          { key: 'left', label: '좌', x: 0.08 },
+                          { key: 'center', label: '중', x: 0.5 },
+                          {
+                            key: 'right',
+                            label: '우',
+                            x: aspectRatio === '9:16' ? 0.86 : 0.92,
+                          },
+                        ] as const
+                      ).map((opt) => (
+                        <Button
+                          key={opt.key}
+                          type="button"
+                          size="xs"
+                          variant="outline"
+                          className="h-6 px-1 text-[11px] border-zinc-700"
+                          onClick={() => {
+                            pushHistory()
+                            const tSet = new Set(multiSelection.textIds)
+                            setTextClips((prev) =>
+                              prev.map((t) =>
+                                tSet.has(t.id)
+                                  ? { ...t, align: opt.key, x: opt.x }
+                                  : t,
+                              ),
+                            )
+                          }}
+                        >
+                          {opt.label}
+                        </Button>
+                      ))}
+                    </div>
+                    <div className="grid grid-cols-3 gap-1">
+                      {(
+                        [
+                          {
+                            key: 'top',
+                            label: '상',
+                            y: aspectRatio === '9:16' ? 0.16 : 0.13,
+                          },
+                          { key: 'middle', label: '중', y: 0.5 },
+                          {
+                            key: 'bottom',
+                            label: '하',
+                            y: aspectRatio === '9:16' ? 0.76 : 0.86,
+                          },
+                        ] as const
+                      ).map((opt) => (
+                        <Button
+                          key={opt.key}
+                          type="button"
+                          size="xs"
+                          variant="outline"
+                          className="h-6 px-1 text-[11px] border-zinc-700"
+                          onClick={() => {
+                            pushHistory()
+                            const tSet = new Set(multiSelection.textIds)
+                            setTextClips((prev) =>
+                              prev.map((t) =>
+                                tSet.has(t.id) ? { ...t, y: opt.y } : t,
+                              ),
+                            )
+                          }}
+                        >
+                          {opt.label}
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Selected Video Clip Inspector */}
           {selectedVideoClip && (
             <div className="space-y-4">
@@ -2208,6 +2692,7 @@ function Editor() {
                       />
                     </div>
 
+                    {ENABLE_AI_MUSIC_REMOVAL_UI && (
                     <div className="pt-2 border-t border-zinc-800/70 space-y-2.5">
                       <div className="space-y-1.5">
                         <div className="flex items-center justify-between gap-2">
@@ -2402,18 +2887,27 @@ function Editor() {
                         </p>
                       </div>
                     </div>
+                    )}
                   </div>
                 )}
               </div>
             </div>
           )}
 
-          {/* Selected Text Clip Inspector */}
+          {/* Selected Caption / Dynamic Text Inspector */}
           {selectedTextClip && (
             <div className="space-y-4">
               <div className="flex items-center justify-between gap-2">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-violet-400">
-                  텍스트 / 캡션 설정
+                <h3
+                  className={`text-xs font-semibold uppercase tracking-wider ${
+                    selectedTextClip.isDynamic
+                      ? 'text-amber-400'
+                      : 'text-violet-400'
+                  }`}
+                >
+                  {selectedTextClip.isDynamic
+                    ? '다이내믹 텍스트 설정'
+                    : '캡션 설정'}
                 </h3>
                 <div className="flex items-center gap-1">
                   <Button
@@ -2759,6 +3253,233 @@ function Editor() {
                   />
                 </label>
               </div>
+
+              {/* Transition Effect Controls (Dynamic Text / Caption) */}
+              <div className="pt-2 border-t border-zinc-800/80 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <Label className="text-xs text-zinc-300">트랜지션 효과</Label>
+                  <div className="grid grid-cols-3 gap-1">
+                    {(
+                      [
+                        { key: 'none', label: '없음' },
+                        { key: 'shrink', label: '축소' },
+                        { key: 'grow', label: '확대' },
+                      ] as const
+                    ).map((opt) => {
+                      const active =
+                        (selectedTextClip.transition ?? 'none') === opt.key
+                      return (
+                        <Button
+                          key={opt.key}
+                          type="button"
+                          size="xs"
+                          variant={active ? 'default' : 'outline'}
+                          className={`h-6 px-2 text-[11px] ${
+                            active
+                              ? 'bg-amber-600 hover:bg-amber-700 text-white'
+                              : 'border-zinc-700 text-zinc-300'
+                          }`}
+                          onClick={() =>
+                            setTextClips((prev) =>
+                              prev.map((t) =>
+                                t.id === selectedTextClip.id
+                                  ? {
+                                      ...t,
+                                      transition: opt.key,
+                                      transitionDuration:
+                                        t.transitionDuration ?? 0.35,
+                                      transitionStartPos:
+                                        t.transitionStartPos ?? 'center',
+                                      transitionEndPos:
+                                        t.transitionEndPos ?? 'center',
+                                      transitionEndBehavior:
+                                        t.transitionEndBehavior ?? 'stay',
+                                    }
+                                  : t,
+                              ),
+                            )
+                          }
+                        >
+                          {opt.label}
+                        </Button>
+                      )
+                    })}
+                  </div>
+                </div>
+
+                {(selectedTextClip.transition ?? 'none') !== 'none' && (
+                  <div className="space-y-2.5">
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-xs text-zinc-300">
+                        <span>트랜지션 유지 시간</span>
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="number"
+                            min={0.05}
+                            max={5}
+                            step={0.05}
+                            value={Number(
+                              (
+                                selectedTextClip.transitionDuration ?? 0.35
+                              ).toFixed(2),
+                            )}
+                            onChange={(e) => {
+                              const raw = Number(e.target.value)
+                              if (!Number.isFinite(raw)) return
+                              const val = Math.max(0.05, Math.min(5, raw))
+                              setTextClips((prev) =>
+                                prev.map((t) =>
+                                  t.id === selectedTextClip.id
+                                    ? { ...t, transitionDuration: val }
+                                    : t,
+                                ),
+                              )
+                            }}
+                            className="w-14 h-6 rounded bg-zinc-900 border border-zinc-700 px-1.5 text-right font-mono text-xs text-zinc-100 focus:border-amber-500 focus:outline-none"
+                          />
+                          <span className="text-[11px] text-zinc-500">초</span>
+                        </div>
+                      </div>
+                      <Slider
+                        min={0.05}
+                        max={3}
+                        step={0.05}
+                        value={[selectedTextClip.transitionDuration ?? 0.35]}
+                        onValueChange={(raw) => {
+                          const val = Array.isArray(raw) ? raw[0] : raw
+                          setTextClips((prev) =>
+                            prev.map((t) =>
+                              t.id === selectedTextClip.id
+                                ? { ...t, transitionDuration: val }
+                                : t,
+                            ),
+                          )
+                        }}
+                      />
+                    </div>
+
+                    {/* 9-grid Start & End Positions inside Safe Zone */}
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-1">
+                        <Label className="text-[11px] text-zinc-400">
+                          시작 위치 (세이프존)
+                        </Label>
+                        <div className="grid grid-cols-3 gap-1">
+                          {NINE_GRID_POSITIONS.map((pos) => {
+                            const active =
+                              (selectedTextClip.transitionStartPos ??
+                                'center') === pos.id
+                            return (
+                              <Button
+                                key={`start-${pos.id}`}
+                                type="button"
+                                size="xs"
+                                variant={active ? 'default' : 'outline'}
+                                className={`h-6 px-0 text-[10px] ${
+                                  active
+                                    ? 'bg-amber-600 hover:bg-amber-700 text-white'
+                                    : 'border-zinc-700 text-zinc-300'
+                                }`}
+                                onClick={() =>
+                                  setTextClips((prev) =>
+                                    prev.map((t) =>
+                                      t.id === selectedTextClip.id
+                                        ? { ...t, transitionStartPos: pos.id }
+                                        : t,
+                                    ),
+                                  )
+                                }
+                              >
+                                {pos.label}
+                              </Button>
+                            )
+                          })}
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <Label className="text-[11px] text-zinc-400">
+                          마지막 위치 (세이프존)
+                        </Label>
+                        <div className="grid grid-cols-3 gap-1">
+                          {NINE_GRID_POSITIONS.map((pos) => {
+                            const active =
+                              (selectedTextClip.transitionEndPos ?? 'center') ===
+                              pos.id
+                            return (
+                              <Button
+                                key={`end-${pos.id}`}
+                                type="button"
+                                size="xs"
+                                variant={active ? 'default' : 'outline'}
+                                className={`h-6 px-0 text-[10px] ${
+                                  active
+                                    ? 'bg-sky-600 hover:bg-sky-700 text-white'
+                                    : 'border-zinc-700 text-zinc-300'
+                                }`}
+                                onClick={() =>
+                                  setTextClips((prev) =>
+                                    prev.map((t) =>
+                                      t.id === selectedTextClip.id
+                                        ? { ...t, transitionEndPos: pos.id }
+                                        : t,
+                                    ),
+                                  )
+                                }
+                              >
+                                {pos.label}
+                              </Button>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* End Behavior: Stay vs Fade-out */}
+                    <div className="flex items-center justify-between gap-2">
+                      <Label className="text-[11px] text-zinc-300">
+                        트랜지션 종료 후
+                      </Label>
+                      <div className="grid grid-cols-2 gap-1">
+                        {(
+                          [
+                            { key: 'stay', label: '그대로 유지' },
+                            { key: 'fade-out', label: '페이드아웃' },
+                          ] as const
+                        ).map((opt) => {
+                          const active =
+                            (selectedTextClip.transitionEndBehavior ?? 'stay') ===
+                            opt.key
+                          return (
+                            <Button
+                              key={opt.key}
+                              type="button"
+                              size="xs"
+                              variant={active ? 'default' : 'outline'}
+                              className={`h-6 px-2 text-[11px] ${
+                                active
+                                  ? 'bg-amber-600 hover:bg-amber-700 text-white'
+                                  : 'border-zinc-700 text-zinc-300'
+                              }`}
+                              onClick={() =>
+                                setTextClips((prev) =>
+                                  prev.map((t) =>
+                                    t.id === selectedTextClip.id
+                                      ? { ...t, transitionEndBehavior: opt.key }
+                                      : t,
+                                  ),
+                                )
+                              }
+                            >
+                              {opt.label}
+                            </Button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -2890,7 +3611,7 @@ function Editor() {
                 <li>• Home / End: 처음 / 끝으로 이동</li>
                 <li>• = / - / \: 타임라인 확대 · 축소 · 맞춤</li>
                 <li>• ` (백틱): 전체화면 미리보기</li>
-                <li>• T: 텍스트/캡션 추가</li>
+                <li>• T: 캡션 추가</li>
                 <li>• Ctrl+M: 현재 비율 FHD 내보내기</li>
                 <li>• Ctrl+C / Ctrl+V / Alt+드래그: 복사 · 붙여넣기</li>
                 <li>• Ctrl+Z / Ctrl+Shift+Z: 실행 취소 · 다시 실행</li>
@@ -2918,12 +3639,20 @@ function Editor() {
         musicClip={musicClip}
         assets={assets}
         selection={selection}
-        onSelect={setSelection}
+        multiSelection={multiSelection}
+        onSelect={(target) => {
+          setMultiSelection({ videoIds: [], textIds: [] })
+          setSelection(target)
+        }}
+        onToggleMultiSelect={handleToggleMultiSelect}
+        onMarqueeSelect={handleMarqueeSelect}
+        onMoveMultiClips={handleMoveMultiClips}
         onTrimLeft={handleTrimLeft}
         onTrimRight={handleTrimRight}
         onSplit={handleSplit}
         onRemoveGaps={handleRemoveGaps}
         onAddText={handleAddText}
+        onAddDynamicText={handleAddDynamicText}
         onDeleteSelected={handleDeleteSelected}
         onBeginDrag={pushHistory}
         onMoveVideoClip={(id, nextStart) =>

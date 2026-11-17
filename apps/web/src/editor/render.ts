@@ -14,6 +14,7 @@ export interface RenderFrameParams {
   videoElement: HTMLVideoElement | HTMLCanvasElement | ImageBitmap | null
   videoClip: VideoClip | null
   activeTexts: TextClip[]
+  currentTime?: number
   showSafeZone?: boolean
 }
 
@@ -79,11 +80,46 @@ export function drawVideoFrame(
   ctx.drawImage(source, drawX, drawY, drawW, drawH)
 }
 
+function getSafeGridCenter(
+  pos: NineGridPosition,
+  safe: { x: number; y: number; w: number; h: number },
+  blockW: number,
+  blockH: number,
+): { cx: number; cy: number } {
+  const [vKey, hKey] = pos.split('-') as [
+    'top' | 'middle' | 'bottom',
+    'left' | 'center' | 'right' | undefined,
+  ]
+  const vAlign: 'top' | 'middle' | 'bottom' = pos === 'center' ? 'middle' : vKey
+  const hAlign: 'left' | 'center' | 'right' =
+    pos === 'center' ? 'center' : (hKey ?? 'center')
+
+  const halfW = Math.min(safe.w / 2, blockW / 2)
+  const halfH = Math.min(safe.h / 2, blockH / 2)
+
+  const cx =
+    hAlign === 'left'
+      ? safe.x + halfW
+      : hAlign === 'right'
+        ? safe.x + safe.w - halfW
+        : safe.x + safe.w / 2
+
+  const cy =
+    vAlign === 'top'
+      ? safe.y + halfH
+      : vAlign === 'bottom'
+        ? safe.y + safe.h - halfH
+        : safe.y + safe.h / 2
+
+  return { cx, cy }
+}
+
 export function drawTextClip(
   ctx: CanvasRenderingContext2D,
   width: number,
   height: number,
   clip: TextClip,
+  currentTime?: number,
 ) {
   if (!clip.text) return
   const unitScale = Math.min(width, height) / 1080
@@ -103,18 +139,7 @@ export function drawTextClip(
   )
   const padY = clip.backgroundColor ? fontSize * 0.28 : 0
 
-  const halfBlockH = totalHeight / 2 + padY
-  const minCenterY = safe.y + halfBlockH
-  const maxCenterY = safe.y + safe.h - halfBlockH
-  const anchorY =
-    minCenterY <= maxCenterY
-      ? Math.max(minCenterY, Math.min(maxCenterY, clip.y * height))
-      : safe.y + safe.h / 2
-
-  const anchorX = clip.x * width
-  const startY = anchorY - totalHeight / 2 + lineHeight / 2
-
-  // Measure each line to optionally draw background box
+  // Measure each line first so 9-grid and background box stay exact
   const lineWidths = lines.map((line) => {
     let w = 0
     for (const ch of line) {
@@ -123,6 +148,73 @@ export function drawTextClip(
     return w
   })
   const maxLineWidth = Math.max(0, ...lineWidths)
+
+  const halfBlockH = totalHeight / 2 + padY
+  const minCenterY = safe.y + halfBlockH
+  const maxCenterY = safe.y + safe.h - halfBlockH
+  let anchorY =
+    minCenterY <= maxCenterY
+      ? Math.max(minCenterY, Math.min(maxCenterY, clip.y * height))
+      : safe.y + safe.h / 2
+
+  let anchorX = clip.x * width
+
+  const transition = clip.transition ?? 'none'
+  if (
+    (transition === 'shrink' || transition === 'grow') &&
+    currentTime !== undefined
+  ) {
+    const dur = Math.max(0.05, clip.transitionDuration ?? 0.35)
+    const elapsed = Math.max(0, currentTime - clip.timelineStart)
+    const progress = Math.min(1, elapsed / dur)
+    const eased = 1 - Math.pow(1 - progress, 3)
+    const animScale =
+      transition === 'shrink' ? 2.4 - 1.4 * eased : 0.25 + 0.75 * eased
+
+    if (clip.transitionEndBehavior === 'fade-out' && elapsed > dur) {
+      const fadeDur = 0.3
+      const fadeProgress = Math.min(1, (elapsed - dur) / fadeDur)
+      const alpha = 1 - fadeProgress
+      if (alpha <= 0.005) {
+        ctx.restore()
+        return
+      }
+      ctx.globalAlpha = alpha
+    }
+
+    let centerX = anchorX
+    if (clip.align === 'left') centerX = anchorX + maxLineWidth / 2
+    if (clip.align === 'right') centerX = anchorX - maxLineWidth / 2
+
+    if (clip.transitionStartPos || clip.transitionEndPos) {
+      const startCenter = getSafeGridCenter(
+        clip.transitionStartPos ?? 'center',
+        safe,
+        maxLineWidth,
+        totalHeight + padY * 2,
+      )
+      const endCenter = getSafeGridCenter(
+        clip.transitionEndPos ?? 'center',
+        safe,
+        maxLineWidth,
+        totalHeight + padY * 2,
+      )
+      centerX = startCenter.cx + (endCenter.cx - startCenter.cx) * eased
+      anchorY = startCenter.cy + (endCenter.cy - startCenter.cy) * eased
+      anchorX =
+        clip.align === 'left'
+          ? centerX - maxLineWidth / 2
+          : clip.align === 'right'
+            ? centerX + maxLineWidth / 2
+            : centerX
+    }
+
+    ctx.translate(centerX, anchorY)
+    ctx.scale(animScale, animScale)
+    ctx.translate(-centerX, -anchorY)
+  }
+
+  const startY = anchorY - totalHeight / 2 + lineHeight / 2
 
   if (clip.backgroundColor) {
     const bgPadX = fontSize * 0.45
@@ -208,6 +300,7 @@ export function renderFrame(params: RenderFrameParams) {
     videoElement,
     videoClip,
     activeTexts,
+    currentTime,
     showSafeZone,
   } = params
 
@@ -220,7 +313,7 @@ export function renderFrame(params: RenderFrameParams) {
   }
 
   for (const textClip of activeTexts) {
-    drawTextClip(ctx, width, height, textClip)
+    drawTextClip(ctx, width, height, textClip, currentTime)
   }
 
   if (showSafeZone) {

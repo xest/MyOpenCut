@@ -143,7 +143,7 @@ export function PerCharColorEditor({
       <div className="space-y-1.5">
         <div className="flex items-center justify-between gap-2">
           <Label className="text-xs text-zinc-300">
-            텍스트 / 캡션 내용{' '}
+            캡션 내용{' '}
             <span className="text-[11px] text-zinc-500 font-normal">
               (일부 드래그 선택 후 색상 변경)
             </span>
