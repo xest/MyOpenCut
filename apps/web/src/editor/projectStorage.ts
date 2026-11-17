@@ -24,6 +24,7 @@ export interface ProjectFileV1 {
 
 const AUTOSAVE_DB_NAME = 'myopencut_db'
 const AUTOSAVE_STORE = 'autosave'
+const HANDLE_STORE = 'handles'
 const AUTOSAVE_KEY = 'latest_project_v1'
 
 export function serializeProject(params: {
@@ -105,6 +106,66 @@ export async function saveBlobWithPicker(
   return true
 }
 
+export async function saveProjectWithHandle(
+  project: ProjectFileV1,
+  existingHandle: FileSystemFileHandle | null,
+  forceSaveAs = false,
+): Promise<{
+  saved: boolean
+  handle: FileSystemFileHandle | null
+  cancelled?: boolean
+}> {
+  const json = JSON.stringify(project, null, 2)
+  const blob = new Blob([json], { type: 'application/json' })
+  const stamp = new Date().toISOString().slice(0, 10)
+  const suggestedName = `project-${stamp}.kremble.json`
+
+  const win = window as Window & {
+    showSaveFilePicker?: (opts?: unknown) => Promise<FileSystemFileHandle>
+  }
+
+  if (!forceSaveAs && existingHandle) {
+    try {
+      const writable = await existingHandle.createWritable()
+      await writable.write(blob)
+      await writable.close()
+      return { saved: true, handle: existingHandle }
+    } catch {
+      // Fall through to picker if handle permission expired
+    }
+  }
+
+  if (typeof win.showSaveFilePicker === 'function') {
+    try {
+      const handle = await win.showSaveFilePicker({
+        suggestedName,
+        types: [
+          {
+            description: 'Kremble Cut 프로젝트 파일',
+            accept: { 'application/json': ['.json'] },
+          },
+        ],
+      })
+      const writable = await handle.createWritable()
+      await writable.write(blob)
+      await writable.close()
+      return { saved: true, handle }
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') {
+        return { saved: false, handle: existingHandle, cancelled: true }
+      }
+    }
+  }
+
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = suggestedName
+  a.click()
+  URL.revokeObjectURL(url)
+  return { saved: true, handle: existingHandle }
+}
+
 export async function downloadProjectJson(
   project: ProjectFileV1,
   filename?: string,
@@ -114,8 +175,8 @@ export async function downloadProjectJson(
   const stamp = new Date().toISOString().slice(0, 10)
   return saveBlobWithPicker(
     blob,
-    filename ?? `project-${stamp}.myopencut.json`,
-    'MyOpenCut 프로젝트 파일',
+    filename ?? `project-${stamp}.kremble.json`,
+    'Kremble Cut 프로젝트 파일',
     'application/json',
     ['.json'],
   )
@@ -124,7 +185,7 @@ export async function downloadProjectJson(
 export function parseProjectJson(raw: string): ProjectFileV1 {
   const data = JSON.parse(raw) as Partial<ProjectFileV1>
   if (data.version !== 1 || !Array.isArray(data.videoClips)) {
-    throw new Error('올바른 MyOpenCut 프로젝트 파일(.myopencut.json)이 아닙니다.')
+    throw new Error('올바른 Kremble Cut 프로젝트 파일(.json)이 아닙니다.')
   }
   return {
     version: 1,
@@ -140,16 +201,117 @@ export function parseProjectJson(raw: string): ProjectFileV1 {
 
 function openAutosaveDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = window.indexedDB.open(AUTOSAVE_DB_NAME, 1)
+    const req = window.indexedDB.open(AUTOSAVE_DB_NAME, 2)
     req.onupgradeneeded = () => {
       const db = req.result
       if (!db.objectStoreNames.contains(AUTOSAVE_STORE)) {
         db.createObjectStore(AUTOSAVE_STORE)
       }
+      if (!db.objectStoreNames.contains(HANDLE_STORE)) {
+        db.createObjectStore(HANDLE_STORE)
+      }
     }
     req.onsuccess = () => resolve(req.result)
     req.onerror = () => reject(req.error)
   })
+}
+
+export async function saveAssetHandle(
+  key: string,
+  handle: FileSystemFileHandle,
+): Promise<void> {
+  if (typeof window === 'undefined' || !window.indexedDB) return
+  try {
+    const db = await openAutosaveDb()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(HANDLE_STORE, 'readwrite')
+      tx.objectStore(HANDLE_STORE).put(handle, key)
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+    })
+    db.close()
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export async function resolveSavedAssetFiles(
+  manifest: ProjectAssetManifest[],
+): Promise<Map<string, File>> {
+  const result = new Map<string, File>()
+  if (typeof window === 'undefined' || !window.indexedDB || manifest.length === 0) {
+    return result
+  }
+  try {
+    const db = await openAutosaveDb()
+    const entries: { key: string; handle: FileSystemFileHandle }[] =
+      await new Promise((resolve) => {
+        const tx = db.transaction(HANDLE_STORE, 'readonly')
+        const store = tx.objectStore(HANDLE_STORE)
+        const out: { key: string; handle: FileSystemFileHandle }[] = []
+        const req = store.openCursor()
+        req.onsuccess = () => {
+          const cursor = req.result
+          if (cursor) {
+            out.push({
+              key: String(cursor.key),
+              handle: cursor.value as FileSystemFileHandle,
+            })
+            cursor.continue()
+          } else {
+            resolve(out)
+          }
+        }
+        req.onerror = () => resolve([])
+      })
+    db.close()
+
+    for (const meta of manifest) {
+      const byId = entries.find((e) => e.key === meta.id)
+      const bySignature = entries.find(
+        (e) => e.key === `${meta.name}::${meta.size}`,
+      )
+      const entry = byId ?? bySignature
+      if (!entry) continue
+      const h = entry.handle as FileSystemFileHandle & {
+        queryPermission?: (opts: { mode: 'read' }) => Promise<string>
+        requestPermission?: (opts: { mode: 'read' }) => Promise<string>
+      }
+      try {
+        let perm = h.queryPermission
+          ? await h.queryPermission({ mode: 'read' })
+          : 'granted'
+        if (perm !== 'granted' && h.requestPermission) {
+          perm = await h.requestPermission({ mode: 'read' })
+        }
+        if (perm === 'granted') {
+          const file = await h.getFile()
+          result.set(meta.id, file)
+        }
+      } catch {
+        // Ignore inaccessible handle
+      }
+    }
+  } catch {
+    // Ignore DB errors
+  }
+  return result
+}
+
+export async function saveFileInDirectory(
+  dirHandle: FileSystemDirectoryHandle,
+  fileName: string,
+  blob: Blob,
+): Promise<boolean> {
+  try {
+    const fileHandle = await dirHandle.getFileHandle(fileName, { create: true })
+    const writable = await fileHandle.createWritable()
+    await writable.write(blob)
+    await writable.close()
+    return true
+  } catch {
+    return false
+  }
 }
 
 export async function saveAutosaveProject(project: ProjectFileV1): Promise<void> {
