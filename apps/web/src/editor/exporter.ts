@@ -23,6 +23,9 @@ export interface ExportOptions {
   textClips: TextClip[]
   musicClip: MusicClip | null
   assets: Record<string, MediaAsset>
+  videoTrackHidden?: boolean
+  hiddenCaptionLayers?: number[]
+  musicTrackMuted?: boolean
   onProgress?: (progress: number, status: string) => void
   signal?: AbortSignal
 }
@@ -32,7 +35,7 @@ async function seekVideo(
   targetTime: number,
 ): Promise<void> {
   const clamped = Math.max(0, Math.min(targetTime, video.duration || targetTime))
-  if (Math.abs(video.currentTime - clamped) < 0.004 && video.readyState >= 2) {
+  if (Math.abs(video.currentTime - clamped) < 0.008 && video.readyState >= 2) {
     return
   }
   await new Promise<void>((resolve, reject) => {
@@ -207,6 +210,9 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
     textClips,
     musicClip,
     assets,
+    videoTrackHidden = false,
+    hiddenCaptionLayers = [],
+    musicTrackMuted = false,
     onProgress,
     signal,
   } = options
@@ -229,7 +235,7 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
   const mixedAudio = await renderMixedAudio(
     totalDuration,
     videoClips,
-    musicClip,
+    musicTrackMuted ? null : musicClip,
     assets,
   )
 
@@ -269,6 +275,9 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
     height,
     bitrate: 12_000_000,
     framerate: fps,
+    hardwareAcceleration: 'prefer-hardware',
+    latencyMode: 'realtime',
+    avc: { format: 'avc' },
   })
 
   let audioEncoder: AudioEncoder | null = null
@@ -287,22 +296,48 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
     })
   }
 
+  const hiddenLayerSet = new Set(hiddenCaptionLayers)
+  const visibleTextClips =
+    hiddenLayerSet.size > 0
+      ? textClips.filter((t) => !hiddenLayerSet.has(t.layer ?? 0))
+      : textClips
+
   // Preload hidden video elements per unique asset used in videoClips
   onProgress?.(0.06, '비디오 소스 준비 중...')
   const videoElements = new Map<string, HTMLVideoElement>()
-  const uniqueAssetIds = new Set(videoClips.map((c) => c.assetId))
-  for (const assetId of uniqueAssetIds) {
-    const asset = assets[assetId]
-    if (asset && asset.kind === 'video') {
-      videoElements.set(assetId, await createHiddenVideo(asset.url))
+  if (!videoTrackHidden) {
+    const uniqueAssetIds = new Set(videoClips.map((c) => c.assetId))
+    for (const assetId of uniqueAssetIds) {
+      const asset = assets[assetId]
+      if (asset && asset.kind === 'video') {
+        videoElements.set(assetId, await createHiddenVideo(asset.url))
+      }
     }
   }
 
-  const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
-  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true })
+  const canvas: HTMLCanvasElement | OffscreenCanvas =
+    typeof OffscreenCanvas !== 'undefined'
+      ? new OffscreenCanvas(width, height)
+      : Object.assign(document.createElement('canvas'), { width, height })
+  const ctx = canvas.getContext('2d', {
+    alpha: false,
+  }) as CanvasRenderingContext2D | null
   if (!ctx) throw new Error('Canvas 2D 컨텍스트를 생성할 수 없습니다.')
+
+  const waitForEncoderDrain = () =>
+    new Promise<void>((resolve) => {
+      if (videoEncoder.encodeQueueSize <= 20) {
+        resolve()
+        return
+      }
+      const onDequeue = () => {
+        if (videoEncoder.encodeQueueSize <= 20) {
+          videoEncoder.removeEventListener('dequeue', onDequeue)
+          resolve()
+        }
+      }
+      videoEncoder.addEventListener('dequeue', onDequeue)
+    })
 
   try {
     const frameDurationUs = Math.round(1_000_000 / fps)
@@ -314,8 +349,10 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
       if (encoderError) throw encoderError
 
       const time = f / fps
-      const activeClip = findActiveVideoClip(videoClips, time)
-      const activeTexts = findActiveTextClips(textClips, time)
+      const activeClip = videoTrackHidden
+        ? null
+        : findActiveVideoClip(videoClips, time)
+      const activeTexts = findActiveTextClips(visibleTextClips, time)
       let videoEl: HTMLVideoElement | null = null
 
       if (activeClip) {
@@ -346,15 +383,12 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
       videoEncoder.encode(frame, { keyFrame: f % (fps * 2) === 0 })
       frame.close()
 
-      // Non-blocking backpressure so hardware encoder stays pipelined
-      while (videoEncoder.encodeQueueSize > 16) {
-        if (signal?.aborted) {
-          throw new DOMException('Export aborted', 'AbortError')
-        }
-        await new Promise((r) => setTimeout(r, 2))
+      // Event-driven backpressure with zero timer clamp overhead
+      if (videoEncoder.encodeQueueSize > 24) {
+        await waitForEncoderDrain()
       }
 
-      if (f % 3 === 0 || f === totalFrames - 1) {
+      if (f % 15 === 0 || f === totalFrames - 1) {
         const pct = 0.08 + (f / totalFrames) * 0.8
         onProgress?.(
           pct,
