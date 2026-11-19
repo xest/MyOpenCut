@@ -56,18 +56,16 @@ import {
 import { exportFhdMp4 } from '#/editor/exporter'
 import {
   clearAutosaveProject,
-  loadAutosaveProject,
   parseProjectJson,
   resolveSavedAssetFiles,
   saveAssetHandle,
-  saveAutosaveProject,
   saveBlobWithPicker,
   saveFileInDirectory,
   saveProjectWithHandle,
   serializeProject,
   type ProjectFileV1,
 } from '#/editor/projectStorage'
-import { drawTextClip } from '#/editor/render'
+import { drawTextClip, drawVideoMasks } from '#/editor/render'
 import {
   findActiveTextClips,
   findActiveVideoClip,
@@ -84,6 +82,7 @@ import {
 import {
   CANVAS_PRESETS,
   DEFAULT_FPS,
+  DEFAULT_TRANSITION_DURATION,
   detectResolutionTag,
   type AspectRatio,
   type MediaAsset,
@@ -92,6 +91,7 @@ import {
   type SelectionTarget,
   type TextClip,
   type VideoClip,
+  type VideoMaskRegion,
 } from '#/editor/types'
 import { useMusicPlayer } from '#/editor/useMusicPlayer'
 
@@ -173,8 +173,12 @@ function Editor() {
   const [videoTrackHidden, setVideoTrackHidden] = useState(false)
   const [hiddenCaptionLayers, setHiddenCaptionLayers] = useState<number[]>([])
   const [musicTrackMuted, setMusicTrackMuted] = useState(false)
+  const [videoTrackLocked, setVideoTrackLocked] = useState(false)
+  const [lockedCaptionLayers, setLockedCaptionLayers] = useState<number[]>([])
+  const [musicTrackLocked, setMusicTrackLocked] = useState(false)
   const [audioDb, setAudioDb] = useState<[number, number]>([-60, -60])
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null)
+  const [projectFileName, setProjectFileName] = useState<string | null>(null)
   const [welcomeOpen, setWelcomeOpen] = useState(false)
   const [newProjectName, setNewProjectName] = useState(
     () => `kremble-${new Date().toISOString().slice(0, 10)}`,
@@ -182,6 +186,16 @@ function Editor() {
   const [workspaceDirHandle, setWorkspaceDirHandle] =
     useState<FileSystemDirectoryHandle | null>(null)
   const [guideOpen, setGuideOpen] = useState(false)
+  const [maskDrawMode, setMaskDrawMode] = useState<
+    'clean-plate' | 'blur' | null
+  >(null)
+  const [pendingMaskPoints, setPendingMaskPoints] = useState<
+    { x: number; y: number }[]
+  >([])
+  const [pendingRefSourceTime, setPendingRefSourceTime] = useState<
+    number | null
+  >(null)
+  const cleanPlatesRef = useRef<Map<string, HTMLCanvasElement>>(new Map())
   const projectFileHandleRef = useRef<FileSystemFileHandle | null>(null)
   const [playhead, setPlayhead] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
@@ -414,13 +428,14 @@ function Editor() {
   )
 
   useEffect(() => {
-    if (!isPlaying || !activeVideoClip) return
-    setSelection((prev) =>
-      prev?.kind === 'video' && prev.id === activeVideoClip.id
+    if (!activeVideoClip) return
+    setSelection((prev) => {
+      if (prev?.kind !== 'video') return prev
+      return prev.id === activeVideoClip.id
         ? prev
-        : { kind: 'video', id: activeVideoClip.id },
-    )
-  }, [isPlaying, activeVideoClip])
+        : { kind: 'video', id: activeVideoClip.id }
+    })
+  }, [activeVideoClip])
   const activeTextClips = useMemo(() => {
     const all = findActiveTextClips(textClips, playhead)
     if (hiddenCaptionLayers.length === 0) return all
@@ -595,89 +610,11 @@ function Editor() {
     }
   }, [activeVideoClip, playhead, isPlaying])
 
-  // Load IndexedDB autosave on mount & auto-resolve saved file handles
+  // Set window title and open onboarding dialog on initial mount (autosave disabled)
   useEffect(() => {
     document.title = 'Kremble Cut | Phase8'
-    let cancelled = false
-    void loadAutosaveProject().then(async (saved) => {
-      if (cancelled) return
-      if (
-        !saved ||
-        (saved.videoClips.length === 0 &&
-          saved.textClips.length === 0 &&
-          !saved.musicClip)
-      ) {
-        setWelcomeOpen(true)
-        return
-      }
-      const resolved = await resolveSavedAssetFiles(saved.assets)
-      if (cancelled) return
-      if (resolved.size >= saved.assets.length && saved.assets.length > 0) {
-        applyRestoredProject(saved, resolved, false)
-        return
-      }
-      setPendingProject(saved)
-      setPendingIsAutosave(true)
-      setWelcomeOpen(true)
-    })
-    return () => {
-      cancelled = true
-    }
+    setWelcomeOpen(true)
   }, [])
-
-  // Keep latest serialized snapshot in a ref for the 5-minute workspace file autosave timer
-  const latestSnapshotRef = useRef<ProjectFileV1 | null>(null)
-  useEffect(() => {
-    latestSnapshotRef.current = serializeProject({
-      aspectRatio,
-      playhead,
-      assets,
-      videoClips,
-      textClips,
-      musicClip,
-    })
-  }, [aspectRatio, playhead, assets, videoClips, textClips, musicClip])
-
-  // Auto-save project file every 5 minutes when a project file handle is configured
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      const handle = projectFileHandleRef.current
-      const snapshot = latestSnapshotRef.current
-      if (!handle || !snapshot) return
-      void saveProjectWithHandle(snapshot, handle, false).then((res) => {
-        if (res.saved) {
-          setSaveFeedback('5분 자동 저장됨')
-          window.setTimeout(() => setSaveFeedback(null), 2000)
-        }
-      })
-    }, 5 * 60 * 1000)
-    return () => window.clearInterval(timer)
-  }, [])
-
-  // Debounced IndexedDB autosave whenever project state changes
-  useEffect(() => {
-    if (!prefsReady) return
-    if (
-      videoClips.length === 0 &&
-      textClips.length === 0 &&
-      !musicClip &&
-      Object.keys(assets).length === 0
-    ) {
-      return
-    }
-    const timer = window.setTimeout(() => {
-      const snapshot = serializeProject({
-        aspectRatio,
-        playhead,
-        assets,
-        videoClips,
-        textClips,
-        musicClip,
-      })
-      void saveAutosaveProject(snapshot)
-    }, 800)
-    return () => window.clearTimeout(timer)
-  }, [prefsReady, aspectRatio, playhead, assets, videoClips, textClips, musicClip])
 
   const applyRestoredProject = useCallback(
     (project: ProjectFileV1, fileMap: Map<string, File>, allowPartial = false) => {
@@ -785,6 +722,7 @@ function Editor() {
         await writable.close()
         setWorkspaceDirHandle(dirHandle)
         projectFileHandleRef.current = fileHandle
+        setProjectFileName(fileHandle.name)
       } catch (err) {
         if ((err as Error).name === 'AbortError') return
       }
@@ -792,6 +730,7 @@ function Editor() {
       const res = await saveProjectWithHandle(emptyProject, null, true)
       if (res.cancelled) return
       projectFileHandleRef.current = res.handle
+      if (res.handle) setProjectFileName(res.handle.name)
     }
 
     setAssets({})
@@ -824,17 +763,65 @@ function Editor() {
         project,
         projectFileHandleRef.current,
         forceSaveAs,
+        workspaceDirHandle,
+        projectFileName,
       )
       if (res.handle) {
         projectFileHandleRef.current = res.handle
+        setProjectFileName(res.handle.name)
       }
       if (res.saved) {
         setSaveFeedback('저장됨')
         window.setTimeout(() => setSaveFeedback(null), 1800)
       }
     },
-    [aspectRatio, playhead, assets, videoClips, textClips, musicClip],
+    [
+      aspectRatio,
+      playhead,
+      assets,
+      videoClips,
+      textClips,
+      musicClip,
+      workspaceDirHandle,
+      projectFileName,
+    ],
   )
+
+  const handleOpenProjectWithPicker = useCallback(async () => {
+    const win = window as Window & {
+      showOpenFilePicker?: (opts?: unknown) => Promise<FileSystemFileHandle[]>
+    }
+    if (typeof win.showOpenFilePicker === 'function') {
+      try {
+        const startIn =
+          workspaceDirHandle ?? projectFileHandleRef.current ?? 'documents'
+        const handles = await win.showOpenFilePicker({
+          multiple: false,
+          startIn,
+          types: [
+            {
+              description: 'Kremble Cut 프로젝트 파일',
+              accept: { 'application/json': ['.json'] },
+            },
+          ],
+        })
+        const handle = handles[0]
+        if (!handle) return
+        const file = await handle.getFile()
+        const raw = await file.text()
+        const parsed = parseProjectJson(raw)
+        projectFileHandleRef.current = handle
+        setProjectFileName(file.name)
+        setPendingIsAutosave(false)
+        const resolved = await resolveSavedAssetFiles(parsed.assets)
+        applyRestoredProject(parsed, resolved, false)
+        return
+      } catch (err) {
+        if ((err as Error).name === 'AbortError') return
+      }
+    }
+    projectInputRef.current?.click()
+  }, [workspaceDirHandle, applyRestoredProject])
 
   const handleImportProjectFile = useCallback(
     async (files: FileList | null) => {
@@ -843,6 +830,7 @@ function Editor() {
       try {
         const raw = await file.text()
         const parsed = parseProjectJson(raw)
+        setProjectFileName(file.name)
         setPendingIsAutosave(false)
         const resolved = await resolveSavedAssetFiles(parsed.assets)
         applyRestoredProject(parsed, resolved, false)
@@ -929,7 +917,67 @@ function Editor() {
     [assets, aiRemovalState.active],
   )
 
-  // Render transparent overlay canvas (captions & safe-zone) while hardware <video> renders footage
+  const projectBaseName = useMemo(
+    () =>
+      (projectFileName || 'kremble-project')
+        .replace(/\.kremble\.json$/i, '')
+        .replace(/\.json$/i, ''),
+    [projectFileName],
+  )
+
+  const loadingCleanPlatesRef = useRef<Set<string>>(new Set())
+
+  const ensureCleanPlate = useCallback(
+    (assetId: string, refSourceTime: number, onReady?: () => void) => {
+      const asset = assets[assetId]
+      if (!asset?.url) return
+      const key = `${assetId}:${refSourceTime.toFixed(2)}`
+      if (cleanPlatesRef.current.has(key) || loadingCleanPlatesRef.current.has(key)) {
+        return
+      }
+      loadingCleanPlatesRef.current.add(key)
+
+      const tempVideo = document.createElement('video')
+      tempVideo.muted = true
+      tempVideo.playsInline = true
+      tempVideo.preload = 'auto'
+      tempVideo.src = asset.url
+
+      const cleanup = () => {
+        loadingCleanPlatesRef.current.delete(key)
+        tempVideo.src = ''
+      }
+
+      tempVideo.onloadeddata = () => {
+        const clamped = Math.max(
+          0,
+          Math.min(
+            Math.max(0, (tempVideo.duration || refSourceTime) - 0.02),
+            refSourceTime,
+          ),
+        )
+        tempVideo.currentTime = clamped
+      }
+      tempVideo.onseeked = () => {
+        const w = tempVideo.videoWidth || 1920
+        const h = tempVideo.videoHeight || 1080
+        const plateCanvas = document.createElement('canvas')
+        plateCanvas.width = w
+        plateCanvas.height = h
+        const pCtx = plateCanvas.getContext('2d')
+        if (pCtx) {
+          pCtx.drawImage(tempVideo, 0, 0, w, h)
+          cleanPlatesRef.current.set(key, plateCanvas)
+          onReady?.()
+        }
+        cleanup()
+      }
+      tempVideo.onerror = cleanup
+    },
+    [assets],
+  )
+
+  // Render transparent overlay canvas (masks, captions) while hardware <video> renders footage
   const drawPreview = useCallback(() => {
     const canvas = previewCanvasRef.current
     if (!canvas) return
@@ -944,10 +992,44 @@ function Editor() {
 
     ctx.clearRect(0, 0, previewW, previewH)
 
+    if (
+      activeVideoClip &&
+      !videoTrackHidden &&
+      activeVideoClip.masks &&
+      activeVideoClip.masks.length > 0
+    ) {
+      for (const mask of activeVideoClip.masks) {
+        if (mask.mode === 'clean-plate') {
+          const refT = mask.refSourceTime ?? activeVideoClip.sourceStart
+          const key = `${activeVideoClip.assetId}:${refT.toFixed(2)}`
+          if (!cleanPlatesRef.current.has(key)) {
+            ensureCleanPlate(activeVideoClip.assetId, refT, () => {
+              drawPreviewRef.current()
+            })
+          }
+        }
+      }
+      drawVideoMasks(
+        ctx,
+        previewW,
+        previewH,
+        videoElRef.current,
+        activeVideoClip,
+        cleanPlatesRef.current,
+      )
+    }
+
     for (const textClip of activeTextClips) {
       drawTextClip(ctx, previewW, previewH, textClip, playhead)
     }
-  }, [aspectRatio, activeTextClips, playhead])
+  }, [
+    aspectRatio,
+    activeVideoClip,
+    videoTrackHidden,
+    activeTextClips,
+    playhead,
+    ensureCleanPlate,
+  ])
 
   const drawPreviewRef = useRef(drawPreview)
   drawPreviewRef.current = drawPreview
@@ -1078,7 +1160,7 @@ function Editor() {
         // Layer 2 (캡션 3): 상단 오른쪽 정렬 기본 (10s)
         if (wasEmptyProject && !createdDefaultCaptions) {
           createdDefaultCaptions = true
-          const fullSize = aspectRatio === '9:16' ? 140 : 180
+          const fullSize = 50
           const bottomY = aspectRatio === '9:16' ? 0.76 : 0.86
           const topY = aspectRatio === '9:16' ? 0.16 : 0.13
           const rightX = aspectRatio === '9:16' ? 0.86 : 0.92
@@ -1098,12 +1180,12 @@ function Editor() {
               layer: 0,
               x: 0.5,
               y: 0.5,
-              align: 'center',
+              align: 'left',
               isDynamic: true,
               transition: 'shrink',
-              transitionDuration: 0.35,
+              transitionDuration: DEFAULT_TRANSITION_DURATION,
               transitionStartPos: 'center',
-              transitionEndPos: 'center',
+              transitionEndPos: 'top-left',
               transitionEndBehavior: 'stay',
             },
             {
@@ -1238,7 +1320,7 @@ function Editor() {
   const handleTrimLeft = useCallback(() => {
     if (selection?.kind === 'text') {
       const target = textClips.find((t) => t.id === selection.id)
-      if (!target) return
+      if (!target || lockedCaptionLayers.includes(target.layer ?? 0)) return
       const tEnd = target.timelineStart + target.duration
       if (playhead <= target.timelineStart || playhead >= tEnd - 0.1) return
       pushHistory()
@@ -1251,19 +1333,38 @@ function Editor() {
       )
       return
     }
-    if (selection?.kind !== 'video') return
-    const res = trimClipLeftLinked(videoClips, textClips, selection.id, playhead)
+    if (selection?.kind !== 'video' || videoTrackLocked) return
+    const unlockedTexts = textClips.filter(
+      (t) => !lockedCaptionLayers.includes(t.layer ?? 0),
+    )
+    const lockedTexts = textClips.filter((t) =>
+      lockedCaptionLayers.includes(t.layer ?? 0),
+    )
+    const res = trimClipLeftLinked(
+      videoClips,
+      unlockedTexts,
+      selection.id,
+      playhead,
+    )
     if (res.nextPlayhead === null) return
     pushHistory()
     setVideoClips(res.clips)
-    setTextClips(res.texts)
+    setTextClips([...res.texts, ...lockedTexts])
     setPlayhead(res.nextPlayhead)
-  }, [selection, playhead, videoClips, textClips, pushHistory])
+  }, [
+    selection,
+    playhead,
+    videoClips,
+    textClips,
+    videoTrackLocked,
+    lockedCaptionLayers,
+    pushHistory,
+  ])
 
   const handleTrimRight = useCallback(() => {
     if (selection?.kind === 'text') {
       const target = textClips.find((t) => t.id === selection.id)
-      if (!target) return
+      if (!target || lockedCaptionLayers.includes(target.layer ?? 0)) return
       const tEnd = target.timelineStart + target.duration
       if (playhead >= tEnd || playhead <= target.timelineStart + 0.1) return
       pushHistory()
@@ -1276,21 +1377,37 @@ function Editor() {
       )
       return
     }
-    if (selection?.kind !== 'video') return
+    if (selection?.kind !== 'video' || videoTrackLocked) return
+    const unlockedTexts = textClips.filter(
+      (t) => !lockedCaptionLayers.includes(t.layer ?? 0),
+    )
+    const lockedTexts = textClips.filter((t) =>
+      lockedCaptionLayers.includes(t.layer ?? 0),
+    )
     const res = trimClipRightLinked(
       videoClips,
-      textClips,
+      unlockedTexts,
       selection.id,
       playhead,
     )
     if (res.clips === videoClips) return
     pushHistory()
     setVideoClips(res.clips)
-    setTextClips(res.texts)
-  }, [selection, playhead, videoClips, textClips, pushHistory])
+    setTextClips([...res.texts, ...lockedTexts])
+  }, [
+    selection,
+    playhead,
+    videoClips,
+    textClips,
+    videoTrackLocked,
+    lockedCaptionLayers,
+    pushHistory,
+  ])
 
   const handleSplit = useCallback(() => {
     if (selection?.kind === 'text') {
+      const target = textClips.find((t) => t.id === selection.id)
+      if (!target || lockedCaptionLayers.includes(target.layer ?? 0)) return
       const res = splitTextClipAtTime(textClips, selection.id, playhead, () =>
         nextId('text'),
       )
@@ -1300,6 +1417,7 @@ function Editor() {
       setSelection({ kind: 'text', id: res.rightId })
       return
     }
+    if (videoTrackLocked) return
     const targetVideoId =
       selection?.kind === 'video' ? selection.id : activeVideoClip?.id
     if (!targetVideoId) return
@@ -1309,9 +1427,10 @@ function Editor() {
     if (!res.rightId) return
     pushHistory()
     setVideoClips(res.clips)
-    // Also split any text clips overlapping playhead
+    // Also split unlocked text clips overlapping playhead
     let nextTexts = textClips
     for (const t of textClips) {
+      if (lockedCaptionLayers.includes(t.layer ?? 0)) continue
       if (
         playhead > t.timelineStart + 0.1 &&
         playhead < t.timelineStart + t.duration - 0.1
@@ -1323,15 +1442,30 @@ function Editor() {
     }
     setTextClips(nextTexts)
     setSelection({ kind: 'video', id: res.rightId })
-  }, [selection, activeVideoClip, playhead, videoClips, textClips, pushHistory])
+  }, [
+    selection,
+    activeVideoClip,
+    playhead,
+    videoClips,
+    textClips,
+    videoTrackLocked,
+    lockedCaptionLayers,
+    pushHistory,
+  ])
 
   const handleRemoveGaps = useCallback(() => {
-    if (videoClips.length === 0) return
+    if (videoClips.length === 0 || videoTrackLocked) return
     pushHistory()
-    const res = removeGapsLinked(videoClips, textClips)
+    const unlockedTexts = textClips.filter(
+      (t) => !lockedCaptionLayers.includes(t.layer ?? 0),
+    )
+    const lockedTexts = textClips.filter((t) =>
+      lockedCaptionLayers.includes(t.layer ?? 0),
+    )
+    const res = removeGapsLinked(videoClips, unlockedTexts)
     setVideoClips(res.clips)
-    setTextClips(res.texts)
-  }, [videoClips, textClips, pushHistory])
+    setTextClips([...res.texts, ...lockedTexts])
+  }, [videoClips, textClips, videoTrackLocked, lockedCaptionLayers, pushHistory])
 
   const handleCopySelected = useCallback(() => {
     const multiCount =
@@ -1499,7 +1633,7 @@ function Editor() {
     const timelineStart = activeVideoClip ? activeVideoClip.timelineStart : playhead
     const duration = activeVideoClip ? activeVideoClip.duration : 3
     const layer = findFreeTextLayer(textClips, timelineStart, duration)
-    const defaultSize = aspectRatio === '9:16' ? 140 : 180
+    const defaultSize = 50
     const newText: TextClip = {
       id,
       text: '전체화면 텍스트',
@@ -1515,12 +1649,12 @@ function Editor() {
       layer,
       x: 0.5,
       y: 0.5,
-      align: 'center',
+      align: 'left',
       isDynamic: true,
       transition: 'shrink',
-      transitionDuration: 0.35,
+      transitionDuration: DEFAULT_TRANSITION_DURATION,
       transitionStartPos: 'center',
-      transitionEndPos: 'center',
+      transitionEndPos: 'top-left',
       transitionEndBehavior: 'stay',
     }
     setTextClips((prev) => [...prev, newText])
@@ -1586,7 +1720,7 @@ function Editor() {
       if (Math.abs(stepDelta) < 1e-6) return
       const vSet = new Set(multiSelection.videoIds)
       const tSet = new Set(multiSelection.textIds)
-      if (vSet.size > 0) {
+      if (vSet.size > 0 && !videoTrackLocked) {
         setVideoClips((prev) =>
           prev.map((c) =>
             vSet.has(c.id)
@@ -1598,14 +1732,14 @@ function Editor() {
       if (tSet.size > 0) {
         setTextClips((prev) =>
           prev.map((t) =>
-            tSet.has(t.id)
+            tSet.has(t.id) && !lockedCaptionLayers.includes(t.layer ?? 0)
               ? { ...t, timelineStart: Math.max(0, t.timelineStart + stepDelta) }
               : t,
           ),
         )
       }
     },
-    [multiSelection],
+    [multiSelection, videoTrackLocked, lockedCaptionLayers],
   )
 
   const handleDeleteSelected = useCallback(() => {
@@ -1615,17 +1749,27 @@ function Editor() {
       pushHistory()
       const vSet = new Set(multiSelection.videoIds)
       const tSet = new Set(multiSelection.textIds)
-      if (vSet.size > 0) {
+      if (vSet.size > 0 && !videoTrackLocked) {
         setVideoClips((prev) => prev.filter((c) => !vSet.has(c.id)))
       }
       if (tSet.size > 0) {
-        setTextClips((prev) => prev.filter((t) => !tSet.has(t.id)))
+        setTextClips((prev) =>
+          prev.filter(
+            (t) => !tSet.has(t.id) || lockedCaptionLayers.includes(t.layer ?? 0),
+          ),
+        )
       }
       setMultiSelection({ videoIds: [], textIds: [] })
       setSelection(null)
       return
     }
     if (!selection) return
+    if (selection.kind === 'video' && videoTrackLocked) return
+    if (selection.kind === 'music' && musicTrackLocked) return
+    if (selection.kind === 'text') {
+      const target = textClips.find((t) => t.id === selection.id)
+      if (target && lockedCaptionLayers.includes(target.layer ?? 0)) return
+    }
     pushHistory()
     if (selection.kind === 'video') {
       setVideoClips((prev) => prev.filter((c) => c.id !== selection.id))
@@ -1635,7 +1779,15 @@ function Editor() {
       setMusicClip(null)
     }
     setSelection(null)
-  }, [selection, multiSelection, pushHistory])
+  }, [
+    selection,
+    multiSelection,
+    textClips,
+    videoTrackLocked,
+    lockedCaptionLayers,
+    musicTrackLocked,
+    pushHistory,
+  ])
 
   const togglePlay = useCallback(() => {
     if (isPlaying) {
@@ -1853,7 +2005,7 @@ function Editor() {
         },
       })
 
-      const mp4Name = `kremble-cut-fhd-${targetRatio.replace(':', 'x')}-30fps.mp4`
+      const mp4Name = `${projectBaseName}.mp4`
       let saved = false
       if (workspaceDirHandle) {
         saved = await saveFileInDirectory(workspaceDirHandle, mp4Name, blob)
@@ -1996,7 +2148,7 @@ function Editor() {
             onClick={() => handleSwitchAspectRatio('16:9')}
           >
             <RectangleHorizontal className="w-3.5 h-3.5 mr-1.5" />
-            16:9 가로
+            16:9
           </Button>
           <Button
             type="button"
@@ -2010,13 +2162,21 @@ function Editor() {
             onClick={() => handleSwitchAspectRatio('9:16')}
           >
             <RectangleVertical className="w-3.5 h-3.5 mr-1.5" />
-            9:16 숏폼 비율
+            9:16
           </Button>
         </div>
 
         {/* Actions: Project Save/SaveAs/Load, Safe Zone, Center Guide, Thumbnail, FHD Exports */}
         <div className="flex flex-wrap items-center gap-2">
           <div data-guide="header-save" className="flex items-center gap-1.5">
+            {projectFileName && (
+              <span
+                className="rounded bg-zinc-800/90 border border-zinc-700/70 px-2 py-1 text-xs font-mono text-zinc-300 max-w-44 truncate"
+                title={projectFileName}
+              >
+                {projectFileName}
+              </span>
+            )}
             <Button
               type="button"
               size="sm"
@@ -2043,7 +2203,7 @@ function Editor() {
               size="sm"
               variant="outline"
               className="h-8 text-xs border-zinc-700 text-zinc-200 hover:bg-zinc-800"
-              onClick={() => projectInputRef.current?.click()}
+              onClick={() => void handleOpenProjectWithPicker()}
               title="프로젝트 파일 불러오기"
             >
               <FolderOpen className="w-3.5 h-3.5 mr-1" />
@@ -2103,20 +2263,11 @@ function Editor() {
               size="sm"
               disabled={videoClips.length === 0 || exportState.active}
               className="h-8 text-xs bg-emerald-600 hover:bg-emerald-700 text-white"
-              onClick={() => void handleExport('16:9')}
+              onClick={() => void handleExport(aspectRatio)}
+              title={`현재 비율(${aspectRatio}) FHD MP4로 내보내기`}
             >
               <Download className="w-3.5 h-3.5 mr-1" />
-              FHD 16:9 내보내기
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              disabled={videoClips.length === 0 || exportState.active}
-              className="h-8 text-xs bg-violet-600 hover:bg-violet-700 text-white"
-              onClick={() => void handleExport('9:16')}
-            >
-              <Download className="w-3.5 h-3.5 mr-1" />
-              FHD 9:16 내보내기
+              FHD 내보내기
             </Button>
           </div>
           <Button
@@ -2383,6 +2534,20 @@ function Editor() {
             <div
               onPointerDown={(e) => {
                 if (!activeVideoClip) return
+                if (maskDrawMode) {
+                  const rect = e.currentTarget.getBoundingClientRect()
+                  const x = Math.max(
+                    0,
+                    Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)),
+                  )
+                  const y = Math.max(
+                    0,
+                    Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)),
+                  )
+                  setPendingMaskPoints([{ x, y }])
+                  e.currentTarget.setPointerCapture(e.pointerId)
+                  return
+                }
                 setSelection({ kind: 'video', id: activeVideoClip.id })
                 previewDragRef.current = {
                   clipId: activeVideoClip.id,
@@ -2395,6 +2560,25 @@ function Editor() {
                 e.currentTarget.setPointerCapture(e.pointerId)
               }}
               onPointerMove={(e) => {
+                if (maskDrawMode && e.buttons === 1) {
+                  const rect = e.currentTarget.getBoundingClientRect()
+                  const x = Math.max(
+                    0,
+                    Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)),
+                  )
+                  const y = Math.max(
+                    0,
+                    Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)),
+                  )
+                  setPendingMaskPoints((prev) => {
+                    const last = prev[prev.length - 1]
+                    if (last && Math.hypot(x - last.x, y - last.y) < 0.008) {
+                      return prev
+                    }
+                    return [...prev, { x, y }]
+                  })
+                  return
+                }
                 const drag = previewDragRef.current
                 if (!drag || e.buttons !== 1) return
                 const dx = e.clientX - drag.startX
@@ -2422,13 +2606,51 @@ function Editor() {
                 )
               }}
               onPointerUp={() => {
+                if (maskDrawMode) {
+                  if (activeVideoClip && pendingMaskPoints.length >= 3) {
+                    const refTime =
+                      pendingRefSourceTime ??
+                      activeVideoClip.sourceStart +
+                        Math.max(0, playhead - activeVideoClip.timelineStart)
+                    const newMask: VideoMaskRegion = {
+                      id: `mask-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                      mode: maskDrawMode,
+                      points: pendingMaskPoints,
+                      refSourceTime:
+                        maskDrawMode === 'clean-plate' ? refTime : undefined,
+                      featherPx: 14,
+                      blurPx: maskDrawMode === 'blur' ? 24 : undefined,
+                    }
+                    pushHistory()
+                    setVideoClips((prev) =>
+                      prev.map((c) =>
+                        c.id === activeVideoClip.id
+                          ? { ...c, masks: [...(c.masks ?? []), newMask] }
+                          : c,
+                      ),
+                    )
+                    if (maskDrawMode === 'clean-plate') {
+                      ensureCleanPlate(activeVideoClip.assetId, refTime, () => {
+                        drawPreviewRef.current()
+                      })
+                    }
+                  }
+                  setPendingMaskPoints([])
+                  setMaskDrawMode(null)
+                  return
+                }
                 previewDragRef.current = null
               }}
               onPointerCancel={() => {
+                setPendingMaskPoints([])
                 previewDragRef.current = null
               }}
               className={`relative flex items-center justify-center rounded-md border border-zinc-800 shadow-2xl bg-black overflow-hidden ${
-                activeVideoClip ? 'cursor-move' : ''
+                maskDrawMode
+                  ? 'cursor-crosshair'
+                  : activeVideoClip
+                    ? 'cursor-move'
+                    : ''
               }`}
               style={{
                 width:
@@ -2471,25 +2693,78 @@ function Editor() {
                 ref={previewCanvasRef}
                 className="pointer-events-none absolute inset-0 z-10 w-full h-full"
               />
+              {(pendingMaskPoints.length > 0 || maskDrawMode) && (
+                <svg
+                  viewBox="0 0 100 100"
+                  preserveAspectRatio="none"
+                  className="pointer-events-none absolute inset-0 z-20 w-full h-full"
+                >
+                  {activeVideoClip?.masks?.map((mask) => (
+                    <polygon
+                      key={mask.id}
+                      points={mask.points
+                        .map((p) => `${p.x * 100},${p.y * 100}`)
+                        .join(' ')}
+                      fill={
+                        mask.mode === 'clean-plate'
+                          ? 'rgba(16, 185, 129, 0.14)'
+                          : 'rgba(56, 189, 248, 0.14)'
+                      }
+                      stroke={
+                        mask.mode === 'clean-plate' ? '#34d399' : '#38bdf8'
+                      }
+                      strokeWidth="0.45"
+                      strokeDasharray="1.2 0.8"
+                    />
+                  ))}
+                  {pendingMaskPoints.length > 1 && (
+                    <polygon
+                      points={pendingMaskPoints
+                        .map((p) => `${p.x * 100},${p.y * 100}`)
+                        .join(' ')}
+                      fill={
+                        maskDrawMode === 'clean-plate'
+                          ? 'rgba(16, 185, 129, 0.28)'
+                          : 'rgba(56, 189, 248, 0.28)'
+                      }
+                      stroke={
+                        maskDrawMode === 'clean-plate' ? '#34d399' : '#38bdf8'
+                      }
+                      strokeWidth="0.6"
+                    />
+                  )}
+                </svg>
+              )}
               {showSafeZone && (
-                <div
-                  className="pointer-events-none absolute z-20 border-2 border-dashed border-sky-400/85 bg-sky-400/5"
-                  style={
-                    aspectRatio === '9:16'
-                      ? {
-                          left: '8%',
-                          right: '14%',
-                          top: '12%',
-                          bottom: '20%',
-                        }
-                      : {
-                          left: '8%',
-                          right: '8%',
-                          top: '8%',
-                          bottom: '8%',
-                        }
-                  }
-                />
+                <>
+                  <div
+                    className="pointer-events-none absolute z-20 border-2 border-dashed border-cyan-300 bg-cyan-400/5 shadow-[0_0_0_1px_rgba(0,0,0,0.85),inset_0_0_0_1px_rgba(0,0,0,0.85)]"
+                    style={
+                      aspectRatio === '9:16'
+                        ? {
+                            left: '8%',
+                            right: '14%',
+                            top: '12%',
+                            bottom: '20%',
+                          }
+                        : {
+                            left: '8%',
+                            right: '8%',
+                            top: '8%',
+                            bottom: '8%',
+                          }
+                    }
+                  />
+                  {/* Naver Safe Zone: centered square within existing safe zone */}
+                  <div
+                    className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-20 border-2 border-dashed border-green-400 shadow-[0_0_0_1px_rgba(0,0,0,0.85),inset_0_0_0_1px_rgba(0,0,0,0.85)]"
+                    style={
+                      aspectRatio === '9:16'
+                        ? { width: '72%', aspectRatio: '1 / 1' }
+                        : { height: '84%', aspectRatio: '1 / 1' }
+                    }
+                  />
+                </>
               )}
               {showCenterGuide && (
                 <div className="pointer-events-none absolute inset-0 z-20">
@@ -2756,7 +3031,11 @@ function Editor() {
                 </div>
               )}
 
-              {multiSelection.textIds.length > 0 && (
+              {multiSelection.textIds.length > 0 && (() => {
+                const tSet = new Set(multiSelection.textIds)
+                const selectedBatchTexts = textClips.filter((t) => tSet.has(t.id))
+                const batchFontSize = selectedBatchTexts[0]?.fontSize ?? 64
+                return (
                 <div className="space-y-3 rounded-md border border-violet-800/50 bg-violet-950/20 p-2.5">
                   <div className="text-[11px] font-semibold text-violet-300">
                     선택된 캡션 ({multiSelection.textIds.length}개)
@@ -2769,13 +3048,11 @@ function Editor() {
                         min={12}
                         max={300}
                         step={2}
-                        defaultValue={64}
-                        onBlur={(e) => {
+                        value={batchFontSize}
+                        onChange={(e) => {
                           const raw = Number(e.target.value)
                           if (!Number.isFinite(raw)) return
                           const val = Math.max(12, Math.min(300, raw))
-                          pushHistory()
-                          const tSet = new Set(multiSelection.textIds)
                           setTextClips((prev) =>
                             prev.map((t) =>
                               tSet.has(t.id)
@@ -2795,10 +3072,9 @@ function Editor() {
                       min={24}
                       max={200}
                       step={2}
-                      defaultValue={[64]}
+                      value={[Math.max(24, Math.min(200, batchFontSize))]}
                       onValueChange={(raw) => {
                         const val = Array.isArray(raw) ? raw[0] : raw
-                        const tSet = new Set(multiSelection.textIds)
                         setTextClips((prev) =>
                           prev.map((t) =>
                             tSet.has(t.id)
@@ -2821,7 +3097,6 @@ function Editor() {
                         type="color"
                         defaultValue="#FFFFFF"
                         onChange={(e) => {
-                          const tSet = new Set(multiSelection.textIds)
                           const val = e.target.value
                           setTextClips((prev) =>
                             prev.map((t) =>
@@ -2838,7 +3113,6 @@ function Editor() {
                         type="color"
                         defaultValue="#000000"
                         onChange={(e) => {
-                          const tSet = new Set(multiSelection.textIds)
                           const val = e.target.value
                           setTextClips((prev) =>
                             prev.map((t) =>
@@ -2863,28 +3137,36 @@ function Editor() {
                             x: aspectRatio === '9:16' ? 0.86 : 0.92,
                           },
                         ] as const
-                      ).map((opt) => (
-                        <Button
-                          key={opt.key}
-                          type="button"
-                          size="xs"
-                          variant="outline"
-                          className="h-6 px-1 text-[11px] border-zinc-700"
-                          onClick={() => {
-                            pushHistory()
-                            const tSet = new Set(multiSelection.textIds)
-                            setTextClips((prev) =>
-                              prev.map((t) =>
-                                tSet.has(t.id)
-                                  ? { ...t, align: opt.key, x: opt.x }
-                                  : t,
-                              ),
-                            )
-                          }}
-                        >
-                          {opt.label}
-                        </Button>
-                      ))}
+                      ).map((opt) => {
+                        const active =
+                          selectedBatchTexts.length > 0 &&
+                          selectedBatchTexts.every((t) => t.align === opt.key)
+                        return (
+                          <Button
+                            key={opt.key}
+                            type="button"
+                            size="xs"
+                            variant={active ? 'default' : 'outline'}
+                            className={`h-6 px-1 text-[11px] ${
+                              active
+                                ? 'bg-violet-600 hover:bg-violet-700 text-white'
+                                : 'border-zinc-700 text-zinc-300'
+                            }`}
+                            onClick={() => {
+                              pushHistory()
+                              setTextClips((prev) =>
+                                prev.map((t) =>
+                                  tSet.has(t.id)
+                                    ? { ...t, align: opt.key, x: opt.x }
+                                    : t,
+                                ),
+                              )
+                            }}
+                          >
+                            {opt.label}
+                          </Button>
+                        )
+                      })}
                     </div>
                     <div className="grid grid-cols-3 gap-1">
                       {(
@@ -2901,30 +3183,41 @@ function Editor() {
                             y: aspectRatio === '9:16' ? 0.76 : 0.86,
                           },
                         ] as const
-                      ).map((opt) => (
-                        <Button
-                          key={opt.key}
-                          type="button"
-                          size="xs"
-                          variant="outline"
-                          className="h-6 px-1 text-[11px] border-zinc-700"
-                          onClick={() => {
-                            pushHistory()
-                            const tSet = new Set(multiSelection.textIds)
-                            setTextClips((prev) =>
-                              prev.map((t) =>
-                                tSet.has(t.id) ? { ...t, y: opt.y } : t,
-                              ),
-                            )
-                          }}
-                        >
-                          {opt.label}
-                        </Button>
-                      ))}
+                      ).map((opt) => {
+                        const active =
+                          selectedBatchTexts.length > 0 &&
+                          selectedBatchTexts.every(
+                            (t) => Math.abs(t.y - opt.y) < 0.03,
+                          )
+                        return (
+                          <Button
+                            key={opt.key}
+                            type="button"
+                            size="xs"
+                            variant={active ? 'default' : 'outline'}
+                            className={`h-6 px-1 text-[11px] ${
+                              active
+                                ? 'bg-violet-600 hover:bg-violet-700 text-white'
+                                : 'border-zinc-700 text-zinc-300'
+                            }`}
+                            onClick={() => {
+                              pushHistory()
+                              setTextClips((prev) =>
+                                prev.map((t) =>
+                                  tSet.has(t.id) ? { ...t, y: opt.y } : t,
+                                ),
+                              )
+                            }}
+                          >
+                            {opt.label}
+                          </Button>
+                        )
+                      })}
                     </div>
                   </div>
                 </div>
-              )}
+                )
+              })()}
             </div>
           )}
 
@@ -3114,6 +3407,234 @@ function Editor() {
                           )
                         }}
                       />
+                    </div>
+
+                    {/* Fixed-tripod object removal / blur masks */}
+                    <div className="pt-2 border-t border-zinc-800/70 space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <Label className="text-xs text-zinc-300 font-medium">
+                          오브젝트 제거 / 블러 (고정 삼각대)
+                        </Label>
+                        {maskDrawMode && (
+                          <button
+                            type="button"
+                            className="text-[11px] text-zinc-400 hover:text-zinc-200 underline"
+                            onClick={() => {
+                              setMaskDrawMode(null)
+                              setPendingMaskPoints([])
+                            }}
+                          >
+                            그리기 취소
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <Button
+                          type="button"
+                          size="xs"
+                          variant="outline"
+                          className="w-full h-7 text-[11px] border-emerald-700/60 text-emerald-300 hover:bg-emerald-950/40"
+                          onClick={() => {
+                            const refT =
+                              selectedVideoClip.sourceStart +
+                              Math.max(
+                                0,
+                                Math.min(
+                                  selectedVideoClip.duration,
+                                  playhead - selectedVideoClip.timelineStart,
+                                ),
+                              )
+                            setPendingRefSourceTime(refT)
+                            ensureCleanPlate(selectedVideoClip.assetId, refT, () => {
+                              drawPreviewRef.current()
+                            })
+                          }}
+                        >
+                          현재 프레임을 깨끗한 배경으로 지정 (
+                          {(
+                            pendingRefSourceTime ??
+                            selectedVideoClip.sourceStart +
+                              Math.max(
+                                0,
+                                Math.min(
+                                  selectedVideoClip.duration,
+                                  playhead - selectedVideoClip.timelineStart,
+                                ),
+                              )
+                          ).toFixed(2)}
+                          s)
+                        </Button>
+
+                        <div className="grid grid-cols-2 gap-1.5">
+                          <Button
+                            type="button"
+                            size="xs"
+                            variant={
+                              maskDrawMode === 'clean-plate'
+                                ? 'default'
+                                : 'outline'
+                            }
+                            className={`h-7 text-[11px] ${
+                              maskDrawMode === 'clean-plate'
+                                ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                : 'border-zinc-700 text-zinc-200 hover:bg-zinc-800'
+                            }`}
+                            onClick={() => {
+                              setIsPlaying(false)
+                              setPendingMaskPoints([])
+                              setMaskDrawMode((m) =>
+                                m === 'clean-plate' ? null : 'clean-plate',
+                              )
+                            }}
+                          >
+                            배경 교체 그리기
+                          </Button>
+                          <Button
+                            type="button"
+                            size="xs"
+                            variant={
+                              maskDrawMode === 'blur' ? 'default' : 'outline'
+                            }
+                            className={`h-7 text-[11px] ${
+                              maskDrawMode === 'blur'
+                                ? 'bg-sky-600 hover:bg-sky-700 text-white'
+                                : 'border-zinc-700 text-zinc-200 hover:bg-zinc-800'
+                            }`}
+                            onClick={() => {
+                              setIsPlaying(false)
+                              setPendingMaskPoints([])
+                              setMaskDrawMode((m) =>
+                                m === 'blur' ? null : 'blur',
+                              )
+                            }}
+                          >
+                            블러 영역 그리기
+                          </Button>
+                        </div>
+
+                        {maskDrawMode && (
+                          <p className="text-[11px] text-amber-300 leading-relaxed">
+                            미리보기 화면에서 제거/블러할 영역을 마우스로 자유롭게
+                            그려주세요.
+                          </p>
+                        )}
+                      </div>
+
+                      {(selectedVideoClip.masks?.length ?? 0) > 0 && (
+                        <div className="space-y-2 pt-1">
+                          {selectedVideoClip.masks!.map((mask, idx) => (
+                            <div
+                              key={mask.id}
+                              className="rounded border border-zinc-800 bg-zinc-950/70 p-2 space-y-1.5"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span
+                                  className={`text-[11px] font-medium ${
+                                    mask.mode === 'clean-plate'
+                                      ? 'text-emerald-300'
+                                      : 'text-sky-300'
+                                  }`}
+                                >
+                                  #{idx + 1}{' '}
+                                  {mask.mode === 'clean-plate'
+                                    ? `배경 교체 (${(mask.refSourceTime ?? selectedVideoClip.sourceStart).toFixed(2)}s)`
+                                    : '가우시안 블러'}
+                                </span>
+                                <Button
+                                  type="button"
+                                  size="xs"
+                                  variant="ghost"
+                                  className="h-5 px-1.5 text-[10px] text-red-400 hover:text-red-300 hover:bg-red-950/30"
+                                  onClick={() => {
+                                    pushHistory()
+                                    setVideoClips((prev) =>
+                                      prev.map((c) =>
+                                        c.id === selectedVideoClip.id
+                                          ? {
+                                              ...c,
+                                              masks: (c.masks ?? []).filter(
+                                                (m) => m.id !== mask.id,
+                                              ),
+                                            }
+                                          : c,
+                                      ),
+                                    )
+                                  }}
+                                >
+                                  삭제
+                                </Button>
+                              </div>
+
+                              <div className="space-y-1">
+                                <div className="flex justify-between text-[10px] text-zinc-400">
+                                  <span>가장자리 부드럽게 (Feather)</span>
+                                  <span className="font-mono">
+                                    {mask.featherPx ?? 14}px
+                                  </span>
+                                </div>
+                                <Slider
+                                  value={[mask.featherPx ?? 14]}
+                                  min={0}
+                                  max={48}
+                                  step={1}
+                                  onValueChange={(val) => {
+                                    const v = Array.isArray(val) ? val[0] : (val as number)
+                                    setVideoClips((prev) =>
+                                      prev.map((c) =>
+                                        c.id === selectedVideoClip.id
+                                          ? {
+                                              ...c,
+                                              masks: (c.masks ?? []).map((m) =>
+                                                m.id === mask.id
+                                                  ? { ...m, featherPx: v }
+                                                  : m,
+                                              ),
+                                            }
+                                          : c,
+                                      ),
+                                    )
+                                  }}
+                                />
+                              </div>
+
+                              {mask.mode === 'blur' && (
+                                <div className="space-y-1">
+                                  <div className="flex justify-between text-[10px] text-zinc-400">
+                                    <span>블러 강도</span>
+                                    <span className="font-mono">
+                                      {mask.blurPx ?? 24}px
+                                    </span>
+                                  </div>
+                                  <Slider
+                                    value={[mask.blurPx ?? 24]}
+                                    min={4}
+                                    max={64}
+                                    step={2}
+                                    onValueChange={(val) => {
+                                      const v = Array.isArray(val) ? val[0] : (val as number)
+                                      setVideoClips((prev) =>
+                                        prev.map((c) =>
+                                          c.id === selectedVideoClip.id
+                                            ? {
+                                                ...c,
+                                                masks: (c.masks ?? []).map((m) =>
+                                                  m.id === mask.id
+                                                    ? { ...m, blurPx: v }
+                                                    : m,
+                                                ),
+                                              }
+                                            : c,
+                                        ),
+                                      )
+                                    }}
+                                  />
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
 
                     {ENABLE_AI_MUSIC_REMOVAL_UI && (
@@ -3711,7 +4232,7 @@ function Editor() {
                                       ...t,
                                       transition: opt.key,
                                       transitionDuration:
-                                        t.transitionDuration ?? 0.35,
+                                        t.transitionDuration ?? DEFAULT_TRANSITION_DURATION,
                                       transitionStartPos:
                                         t.transitionStartPos ?? 'center',
                                       transitionEndPos:
@@ -3744,7 +4265,7 @@ function Editor() {
                             step={0.05}
                             value={Number(
                               (
-                                selectedTextClip.transitionDuration ?? 0.35
+                                selectedTextClip.transitionDuration ?? DEFAULT_TRANSITION_DURATION
                               ).toFixed(2),
                             )}
                             onChange={(e) => {
@@ -3768,7 +4289,7 @@ function Editor() {
                         min={0.05}
                         max={3}
                         step={0.05}
-                        value={[selectedTextClip.transitionDuration ?? 0.35]}
+                        value={[selectedTextClip.transitionDuration ?? DEFAULT_TRANSITION_DURATION]}
                         onValueChange={(raw) => {
                           const val = Array.isArray(raw) ? raw[0] : raw
                           setTextClips((prev) =>
@@ -4171,6 +4692,9 @@ function Editor() {
         videoTrackHidden={videoTrackHidden}
         hiddenCaptionLayers={hiddenCaptionLayers}
         musicTrackMuted={musicTrackMuted}
+        videoTrackLocked={videoTrackLocked}
+        lockedCaptionLayers={lockedCaptionLayers}
+        musicTrackLocked={musicTrackLocked}
         onToggleVideoTrackHidden={() => setVideoTrackHidden((v) => !v)}
         onToggleCaptionLayerHidden={(layer) =>
           setHiddenCaptionLayers((prev) =>
@@ -4180,6 +4704,46 @@ function Editor() {
           )
         }
         onToggleMusicTrackMuted={() => setMusicTrackMuted((m) => !m)}
+        onToggleVideoTrackLocked={() => {
+          setVideoTrackLocked((locked) => {
+            const next = !locked
+            if (next) {
+              setMultiSelection((prev) => ({ ...prev, videoIds: [] }))
+              setSelection((prev) => (prev?.kind === 'video' ? null : prev))
+            }
+            return next
+          })
+        }}
+        onToggleCaptionLayerLocked={(layer) => {
+          setLockedCaptionLayers((prev) => {
+            const nextLocked = !prev.includes(layer)
+            if (nextLocked) {
+              const lockedIds = new Set(
+                textClips
+                  .filter((t) => (t.layer ?? 0) === layer)
+                  .map((t) => t.id),
+              )
+              setMultiSelection((m) => ({
+                ...m,
+                textIds: m.textIds.filter((id) => !lockedIds.has(id)),
+              }))
+              setSelection((s) =>
+                s?.kind === 'text' && lockedIds.has(s.id) ? null : s,
+              )
+              return [...prev, layer]
+            }
+            return prev.filter((l) => l !== layer)
+          })
+        }}
+        onToggleMusicTrackLocked={() => {
+          setMusicTrackLocked((locked) => {
+            const next = !locked
+            if (next) {
+              setSelection((prev) => (prev?.kind === 'music' ? null : prev))
+            }
+            return next
+          })
+        }}
         audioDb={audioDb}
       />
       </div>
@@ -4194,6 +4758,7 @@ function Editor() {
         videoClip={activeVideoClip}
         activeTexts={activeTextClips}
         workspaceDirHandle={workspaceDirHandle}
+        projectBaseName={projectBaseName}
       />
 
       {/* Welcome / Project Setup Dialog */}
