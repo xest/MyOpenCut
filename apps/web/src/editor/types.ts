@@ -1,6 +1,7 @@
 export type AspectRatio = '16:9' | '9:16'
 
 export const DEFAULT_FPS = 30
+export const DEFAULT_TRANSITION_DURATION = 2
 
 export const CANVAS_PRESETS: Record<
   AspectRatio,
@@ -32,6 +33,15 @@ export interface MediaAsset {
   resolutionTag: string
 }
 
+export interface VideoMaskRegion {
+  id: string
+  mode: 'clean-plate' | 'blur'
+  points: { x: number; y: number }[] // normalized 0..1 canvas coordinates
+  refSourceTime?: number // source video timestamp (sec) for clean-plate mode
+  featherPx?: number // 1080p-relative feather radius (default 14)
+  blurPx?: number // 1080p-relative blur radius for blur mode (default 24)
+}
+
 export interface VideoClip {
   id: string
   assetId: string
@@ -46,6 +56,7 @@ export interface VideoClip {
   offsetY: number // -1 to 1 normalized pan
   volume: number // 0 to 1
   muted: boolean
+  masks?: VideoMaskRegion[]
   removeMusic?: boolean
   removeMusicStrength?: number // 0 to 1, default 0.75
   aiCleanAudioUrl?: string
@@ -73,7 +84,7 @@ export interface TextClip {
   align: 'left' | 'center' | 'right'
   isDynamic?: boolean
   transition?: 'none' | 'shrink' | 'grow'
-  transitionDuration?: number // seconds, default 0.35
+  transitionDuration?: number // seconds, default 2
   transitionStartPos?: NineGridPosition
   transitionEndPos?: NineGridPosition
   transitionEndBehavior?: 'stay' | 'fade-out'
@@ -105,6 +116,7 @@ export type NineGridPosition =
 export interface ThumbnailOptions {
   dimEnabled: boolean
   dimPercent: number // default 20 when dimEnabled is checked
+  grayscaleEnabled?: boolean
   overrideTextEnabled: boolean
   overrideText: string
   overrideTextColor: string

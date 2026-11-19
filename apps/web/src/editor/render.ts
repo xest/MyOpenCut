@@ -1,9 +1,10 @@
-import type {
-  AspectRatio,
-  NineGridPosition,
-  TextClip,
-  ThumbnailOptions,
-  VideoClip,
+import {
+  DEFAULT_TRANSITION_DURATION,
+  type AspectRatio,
+  type NineGridPosition,
+  type TextClip,
+  type ThumbnailOptions,
+  type VideoClip,
 } from './types'
 
 export interface RenderFrameParams {
@@ -14,6 +15,7 @@ export interface RenderFrameParams {
   videoElement: HTMLVideoElement | HTMLCanvasElement | ImageBitmap | null
   videoClip: VideoClip | null
   activeTexts: TextClip[]
+  cleanPlates?: Map<string, HTMLCanvasElement>
   currentTime?: number
   showSafeZone?: boolean
 }
@@ -43,6 +45,32 @@ export function getSafeZoneRect(
     y: marginY,
     w: width - marginX * 2,
     h: height - marginY * 2,
+  }
+}
+
+export function getNaverSafeZoneRect(
+  width: number,
+  height: number,
+  aspectRatio: AspectRatio,
+) {
+  const safe = getSafeZoneRect(width, height, aspectRatio)
+  const cx = width / 2
+  const cy = height / 2
+  const halfSize = Math.max(
+    0,
+    Math.min(
+      cx - safe.x,
+      safe.x + safe.w - cx,
+      cy - safe.y,
+      safe.y + safe.h - cy,
+    ),
+  )
+  const size = halfSize * 2
+  return {
+    x: cx - halfSize,
+    y: cy - halfSize,
+    w: size,
+    h: size,
   }
 }
 
@@ -164,7 +192,7 @@ export function drawTextClip(
     (transition === 'shrink' || transition === 'grow') &&
     currentTime !== undefined
   ) {
-    const dur = Math.max(0.05, clip.transitionDuration ?? 0.35)
+    const dur = Math.max(0.05, clip.transitionDuration ?? DEFAULT_TRANSITION_DURATION)
     const elapsed = Math.max(0, currentTime - clip.timelineStart)
     const progress = Math.min(1, elapsed / dur)
     const eased = 1 - Math.pow(1 - progress, 3)
@@ -271,6 +299,123 @@ export function drawTextClip(
   ctx.restore()
 }
 
+let maskScratchCanvas: HTMLCanvasElement | null = null
+let maskAlphaCanvas: HTMLCanvasElement | null = null
+
+function getScratchCanvas(
+  kind: 'patch' | 'alpha',
+  w: number,
+  h: number,
+): HTMLCanvasElement | null {
+  if (typeof document === 'undefined') return null
+  if (kind === 'patch') {
+    if (!maskScratchCanvas) maskScratchCanvas = document.createElement('canvas')
+    if (maskScratchCanvas.width !== w || maskScratchCanvas.height !== h) {
+      maskScratchCanvas.width = w
+      maskScratchCanvas.height = h
+    }
+    return maskScratchCanvas
+  }
+  if (!maskAlphaCanvas) maskAlphaCanvas = document.createElement('canvas')
+  if (maskAlphaCanvas.width !== w || maskAlphaCanvas.height !== h) {
+    maskAlphaCanvas.width = w
+    maskAlphaCanvas.height = h
+  }
+  return maskAlphaCanvas
+}
+
+/**
+ * Renders freehand object-removal masks (clean-plate background replacement or blur)
+ * onto the target 2D canvas. Works identically on live preview overlay and export canvas.
+ */
+export function drawVideoMasks(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  videoElement: HTMLVideoElement | HTMLCanvasElement | ImageBitmap | null,
+  clip: VideoClip,
+  cleanPlates?: Map<string, HTMLCanvasElement>,
+) {
+  const masks = clip.masks
+  if (!masks || masks.length === 0) return
+  const unitScale = Math.min(width, height) / 1080
+
+  for (const mask of masks) {
+    if (mask.points.length < 3) continue
+    const feather = Math.max(0, (mask.featherPx ?? 14) * unitScale)
+
+    if (mask.mode === 'blur') {
+      if (!videoElement) continue
+      const blurRadius = Math.max(2, (mask.blurPx ?? 24) * unitScale)
+      const patchCanvas = getScratchCanvas('patch', width, height)
+      const alphaCanvas = getScratchCanvas('alpha', width, height)
+      if (!patchCanvas || !alphaCanvas) continue
+      const pCtx = patchCanvas.getContext('2d')
+      const aCtx = alphaCanvas.getContext('2d')
+      if (!pCtx || !aCtx) continue
+
+      aCtx.clearRect(0, 0, width, height)
+      aCtx.save()
+      if (feather > 0) aCtx.filter = `blur(${feather}px)`
+      aCtx.fillStyle = '#ffffff'
+      aCtx.beginPath()
+      aCtx.moveTo(mask.points[0].x * width, mask.points[0].y * height)
+      for (let i = 1; i < mask.points.length; i++) {
+        aCtx.lineTo(mask.points[i].x * width, mask.points[i].y * height)
+      }
+      aCtx.closePath()
+      aCtx.fill()
+      aCtx.restore()
+
+      pCtx.clearRect(0, 0, width, height)
+      pCtx.save()
+      pCtx.filter = `blur(${blurRadius}px)`
+      drawVideoFrame(pCtx, width, height, videoElement, clip)
+      pCtx.filter = 'none'
+      pCtx.globalCompositeOperation = 'destination-in'
+      pCtx.drawImage(alphaCanvas, 0, 0)
+      pCtx.restore()
+
+      ctx.drawImage(patchCanvas, 0, 0)
+      continue
+    }
+
+    // clean-plate mode
+    const key = `${clip.assetId}:${(mask.refSourceTime ?? clip.sourceStart).toFixed(2)}`
+    const plate = cleanPlates?.get(key)
+    if (!plate) continue
+
+    const patchCanvas = getScratchCanvas('patch', width, height)
+    const alphaCanvas = getScratchCanvas('alpha', width, height)
+    if (!patchCanvas || !alphaCanvas) continue
+    const pCtx = patchCanvas.getContext('2d')
+    const aCtx = alphaCanvas.getContext('2d')
+    if (!pCtx || !aCtx) continue
+
+    aCtx.clearRect(0, 0, width, height)
+    aCtx.save()
+    if (feather > 0) aCtx.filter = `blur(${feather}px)`
+    aCtx.fillStyle = '#ffffff'
+    aCtx.beginPath()
+    aCtx.moveTo(mask.points[0].x * width, mask.points[0].y * height)
+    for (let i = 1; i < mask.points.length; i++) {
+      aCtx.lineTo(mask.points[i].x * width, mask.points[i].y * height)
+    }
+    aCtx.closePath()
+    aCtx.fill()
+    aCtx.restore()
+
+    pCtx.clearRect(0, 0, width, height)
+    pCtx.save()
+    drawVideoFrame(pCtx, width, height, plate, clip)
+    pCtx.globalCompositeOperation = 'destination-in'
+    pCtx.drawImage(alphaCanvas, 0, 0)
+    pCtx.restore()
+
+    ctx.drawImage(patchCanvas, 0, 0)
+  }
+}
+
 export function drawSafeZoneGuide(
   ctx: CanvasRenderingContext2D,
   width: number,
@@ -278,16 +423,26 @@ export function drawSafeZoneGuide(
   aspectRatio: AspectRatio,
 ) {
   const safe = getSafeZoneRect(width, height, aspectRatio)
+  const lw = Math.max(3, Math.min(width, height) * 0.004)
   ctx.save()
-  ctx.strokeStyle = 'rgba(56, 189, 248, 0.7)'
-  ctx.lineWidth = Math.max(2, Math.min(width, height) * 0.0025)
-  ctx.setLineDash([12, 8])
+  ctx.setLineDash([14, 8])
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.7)'
+  ctx.lineWidth = lw + 2
   ctx.strokeRect(safe.x, safe.y, safe.w, safe.h)
 
-  ctx.fillStyle = 'rgba(56, 189, 248, 0.85)'
-  const labelSize = Math.max(14, Math.min(width, height) * 0.02)
-  ctx.font = `600 ${labelSize}px "Inter Variable", sans-serif`
-  ctx.fillText('SAFE ZONE', safe.x + 10, safe.y + labelSize + 6)
+  ctx.strokeStyle = 'rgba(56, 189, 248, 0.95)'
+  ctx.lineWidth = lw
+  ctx.strokeRect(safe.x, safe.y, safe.w, safe.h)
+
+  // Naver safe zone: centered square within existing safe zone (green dashed)
+  const naver = getNaverSafeZoneRect(width, height, aspectRatio)
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.7)'
+  ctx.lineWidth = lw + 2
+  ctx.strokeRect(naver.x, naver.y, naver.w, naver.h)
+
+  ctx.strokeStyle = 'rgba(74, 222, 128, 0.95)'
+  ctx.lineWidth = lw
+  ctx.strokeRect(naver.x, naver.y, naver.w, naver.h)
   ctx.restore()
 }
 
@@ -300,6 +455,7 @@ export function renderFrame(params: RenderFrameParams) {
     videoElement,
     videoClip,
     activeTexts,
+    cleanPlates,
     currentTime,
     showSafeZone,
   } = params
@@ -310,6 +466,7 @@ export function renderFrame(params: RenderFrameParams) {
 
   if (videoElement && videoClip) {
     drawVideoFrame(ctx, width, height, videoElement, videoClip)
+    drawVideoMasks(ctx, width, height, videoElement, videoClip, cleanPlates)
   }
 
   for (const textClip of activeTexts) {
@@ -389,21 +546,28 @@ export function renderThumbnailFrame(params: {
   ctx.fillRect(0, 0, width, height)
 
   if (videoElement && videoClip) {
-    drawVideoFrame(ctx, width, height, videoElement, videoClip)
-  }
-
-  // If NOT replacing text, keep original active timeline captions
-  if (!options.overrideTextEnabled) {
-    for (const textClip of activeTexts) {
-      drawTextClip(ctx, width, height, textClip, currentTime)
+    if (options.grayscaleEnabled) {
+      ctx.save()
+      ctx.filter = 'grayscale(100%)'
+      drawVideoFrame(ctx, width, height, videoElement, videoClip)
+      ctx.restore()
+    } else {
+      drawVideoFrame(ctx, width, height, videoElement, videoClip)
     }
   }
 
-  // Optional Dim (default 20% when checked)
+  // Optional Dim (default 20% when checked) — applied only to background video, NOT captions
   if (options.dimEnabled && options.dimPercent > 0) {
     const alpha = Math.max(0, Math.min(0.95, options.dimPercent / 100))
     ctx.fillStyle = `rgba(0, 0, 0, ${alpha})`
     ctx.fillRect(0, 0, width, height)
+  }
+
+  // If NOT replacing text, keep original active timeline captions bright above dim
+  if (!options.overrideTextEnabled) {
+    for (const textClip of activeTexts) {
+      drawTextClip(ctx, width, height, textClip, currentTime)
+    }
   }
 
   // Replacement overlay text
