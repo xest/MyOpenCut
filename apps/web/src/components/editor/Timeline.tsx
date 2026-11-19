@@ -2,24 +2,27 @@ import { useEffect, useRef, useState } from 'react'
 import {
   ArrowLeftToLine,
   ArrowRightToLine,
+  Lock,
   Music,
   Scissors,
   Space,
   Sparkles,
   Trash2,
   Type,
+  Unlock,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
 import { Button } from '#/components/ui/button'
 import { Slider } from '#/components/ui/slider'
-import { formatTimecode } from '#/editor/timelineOps'
-import type {
-  MediaAsset,
-  MusicClip,
-  SelectionTarget,
-  TextClip,
-  VideoClip,
+import { findActiveVideoClip, formatTimecode } from '#/editor/timelineOps'
+import {
+  DEFAULT_TRANSITION_DURATION,
+  type MediaAsset,
+  type MusicClip,
+  type SelectionTarget,
+  type TextClip,
+  type VideoClip,
 } from '#/editor/types'
 
 interface TimelineProps {
@@ -61,9 +64,15 @@ interface TimelineProps {
   videoTrackHidden?: boolean
   hiddenCaptionLayers?: number[]
   musicTrackMuted?: boolean
+  videoTrackLocked?: boolean
+  lockedCaptionLayers?: number[]
+  musicTrackLocked?: boolean
   onToggleVideoTrackHidden?: () => void
   onToggleCaptionLayerHidden?: (layer: number) => void
   onToggleMusicTrackMuted?: () => void
+  onToggleVideoTrackLocked?: () => void
+  onToggleCaptionLayerLocked?: (layer: number) => void
+  onToggleMusicTrackLocked?: () => void
   audioDb?: [number, number]
 }
 
@@ -101,9 +110,15 @@ export function Timeline({
   videoTrackHidden = false,
   hiddenCaptionLayers = [],
   musicTrackMuted = false,
+  videoTrackLocked = false,
+  lockedCaptionLayers = [],
+  musicTrackLocked = false,
   onToggleVideoTrackHidden,
   onToggleCaptionLayerHidden,
   onToggleMusicTrackMuted,
+  onToggleVideoTrackLocked,
+  onToggleCaptionLayerLocked,
+  onToggleMusicTrackLocked,
   audioDb = [-60, -60],
 }: TimelineProps) {
   const tracksRef = useRef<HTMLDivElement | null>(null)
@@ -156,12 +171,6 @@ export function Timeline({
     const el = tracksRef.current
     if (!el) return
     const onWheel = (e: WheelEvent) => {
-      if (e.ctrlKey || e.altKey) {
-        e.preventDefault()
-        const factor = e.deltaY < 0 ? 1.15 : 0.85
-        onPxPerSecChange(Math.round(clampZoom(pxPerSec * factor)))
-        return
-      }
       const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY
       if (delta !== 0) {
         e.preventDefault()
@@ -170,7 +179,7 @@ export function Timeline({
     }
     el.addEventListener('wheel', onWheel, { passive: false })
     return () => el.removeEventListener('wheel', onWheel)
-  }, [pxPerSec, onPxPerSecChange])
+  }, [])
 
   // Auto-scroll timeline horizontally when playhead crosses visible left/right bounds
   useEffect(() => {
@@ -228,7 +237,7 @@ export function Timeline({
       targets.push(t.timelineStart, t.timelineStart + t.duration)
       if ((t.transition ?? 'none') !== 'none') {
         targets.push(
-          t.timelineStart + Math.max(0.05, t.transitionDuration ?? 0.35),
+          t.timelineStart + Math.max(0.05, t.transitionDuration ?? DEFAULT_TRANSITION_DURATION),
         )
       }
     }
@@ -252,6 +261,9 @@ export function Timeline({
       ? Boolean(multiSelection?.videoIds.includes(id))
       : Boolean(multiSelection?.textIds.includes(id))
 
+  const isTrackLocked = (kind: 'video' | 'text', layer = 0) =>
+    kind === 'video' ? videoTrackLocked : lockedCaptionLayers.includes(layer)
+
   const startClipDrag = (
     e: React.PointerEvent<HTMLElement>,
     kind: 'video' | 'text',
@@ -264,6 +276,9 @@ export function Timeline({
     origSourceDuration = duration,
   ) => {
     e.stopPropagation()
+    if (isTrackLocked(kind, origLayer)) {
+      return
+    }
     if (e.shiftKey && mode === 'move' && onToggleMultiSelect) {
       onToggleMultiSelect({ kind, id })
       return
@@ -582,20 +597,29 @@ export function Timeline({
       {/* Scrollable Tracks */}
       <div className="flex">
         {/* Track Labels */}
-        <div className="w-32 shrink-0 border-r border-zinc-800 bg-zinc-900/40 flex flex-col">
+        <div className="w-36 shrink-0 border-r border-zinc-800 bg-zinc-900/40 flex flex-col">
           <div className="h-7 border-b border-zinc-800 px-2 flex items-center text-[10px] font-mono text-zinc-500">
             {formatTimecode(playhead)}
           </div>
           {displayedTextLayers.map((layerIdx) => {
             const isHidden = hiddenCaptionLayers.includes(layerIdx)
+            const isLocked = lockedCaptionLayers.includes(layerIdx)
             return (
               <div
                 key={`text-label-${layerIdx}`}
-                onClick={() => onToggleTrackSelect?.('text', layerIdx)}
-                className={`h-9 border-b border-zinc-800/70 px-2 flex items-center gap-1.5 text-xs cursor-pointer hover:bg-zinc-800/40 ${
-                  isHidden ? 'text-zinc-500' : 'text-violet-300'
-                }`}
-                title="클릭하여 이 트랙의 모든 캡션 선택/해제"
+                onClick={() => {
+                  if (!isLocked) onToggleTrackSelect?.('text', layerIdx)
+                }}
+                className={`h-9 border-b border-zinc-800/70 px-2 flex items-center gap-1.5 text-xs ${
+                  isLocked
+                    ? 'cursor-not-allowed bg-zinc-900/70 text-zinc-400'
+                    : 'cursor-pointer hover:bg-zinc-800/40'
+                } ${isHidden ? 'text-zinc-500' : 'text-violet-300'}`}
+                title={
+                  isLocked
+                    ? '잠긴 트랙 (자물쇠를 눌러 잠금 해제)'
+                    : '클릭하여 이 트랙의 모든 캡션 선택/해제'
+                }
               >
                 <input
                   type="checkbox"
@@ -605,6 +629,23 @@ export function Timeline({
                   className="h-3.5 w-3.5 accent-violet-500 cursor-pointer shrink-0"
                   title="캡션 레이어 보이기/숨기기"
                 />
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onToggleCaptionLayerLocked?.(layerIdx)
+                  }}
+                  className={`p-0.5 rounded hover:bg-zinc-700/60 shrink-0 ${
+                    isLocked ? 'text-amber-400' : 'text-zinc-500 hover:text-zinc-300'
+                  }`}
+                  title={isLocked ? '트랙 잠금 해제' : '트랙 잠금'}
+                >
+                  {isLocked ? (
+                    <Lock className="w-3 h-3" />
+                  ) : (
+                    <Unlock className="w-3 h-3" />
+                  )}
+                </button>
                 <Type className="w-3 h-3 shrink-0" />
                 <span className="truncate">
                   {textLayerCount > 1 ? `캡션 ${layerIdx + 1}` : '캡션'}
@@ -613,11 +654,19 @@ export function Timeline({
             )
           })}
           <div
-            onClick={() => onToggleTrackSelect?.('video')}
-            className={`h-14 border-b border-zinc-800/70 px-2 flex items-center gap-1.5 text-xs cursor-pointer hover:bg-zinc-800/40 ${
-              videoTrackHidden ? 'text-zinc-500' : 'text-sky-300'
-            }`}
-            title="클릭하여 모든 비디오 클립 선택/해제"
+            onClick={() => {
+              if (!videoTrackLocked) onToggleTrackSelect?.('video')
+            }}
+            className={`h-14 border-b border-zinc-800/70 px-2 flex items-center gap-1.5 text-xs ${
+              videoTrackLocked
+                ? 'cursor-not-allowed bg-zinc-900/70 text-zinc-400'
+                : 'cursor-pointer hover:bg-zinc-800/40'
+            } ${videoTrackHidden ? 'text-zinc-500' : 'text-sky-300'}`}
+            title={
+              videoTrackLocked
+                ? '잠긴 트랙 (자물쇠를 눌러 잠금 해제)'
+                : '클릭하여 모든 비디오 클립 선택/해제'
+            }
           >
             <input
               type="checkbox"
@@ -627,15 +676,42 @@ export function Timeline({
               className="h-3.5 w-3.5 accent-sky-500 cursor-pointer shrink-0"
               title="비디오 트랙 보이기/숨기기"
             />
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation()
+                onToggleVideoTrackLocked?.()
+              }}
+              className={`p-0.5 rounded hover:bg-zinc-700/60 shrink-0 ${
+                videoTrackLocked
+                  ? 'text-amber-400'
+                  : 'text-zinc-500 hover:text-zinc-300'
+              }`}
+              title={videoTrackLocked ? '비디오 트랙 잠금 해제' : '비디오 트랙 잠금'}
+            >
+              {videoTrackLocked ? (
+                <Lock className="w-3 h-3" />
+              ) : (
+                <Unlock className="w-3 h-3" />
+              )}
+            </button>
             <span className="w-2 h-2 rounded-full bg-sky-400 shrink-0" />
             <span className="truncate">비디오</span>
           </div>
           <div
-            onClick={() => onToggleTrackSelect?.('music')}
-            className={`h-11 px-2 flex items-center gap-1.5 text-xs cursor-pointer hover:bg-zinc-800/40 ${
-              musicTrackMuted ? 'text-zinc-500' : 'text-emerald-300'
-            }`}
-            title="클릭하여 음악 트랙 선택/해제"
+            onClick={() => {
+              if (!musicTrackLocked) onToggleTrackSelect?.('music')
+            }}
+            className={`h-11 px-2 flex items-center gap-1.5 text-xs ${
+              musicTrackLocked
+                ? 'cursor-not-allowed bg-zinc-900/70 text-zinc-400'
+                : 'cursor-pointer hover:bg-zinc-800/40'
+            } ${musicTrackMuted ? 'text-zinc-500' : 'text-emerald-300'}`}
+            title={
+              musicTrackLocked
+                ? '잠긴 트랙 (자물쇠를 눌러 잠금 해제)'
+                : '클릭하여 음악 트랙 선택/해제'
+            }
           >
             <input
               type="checkbox"
@@ -645,6 +721,25 @@ export function Timeline({
               className="h-3.5 w-3.5 accent-emerald-500 cursor-pointer shrink-0"
               title="음악 트랙 소리 켜기/끄기"
             />
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation()
+                onToggleMusicTrackLocked?.()
+              }}
+              className={`p-0.5 rounded hover:bg-zinc-700/60 shrink-0 ${
+                musicTrackLocked
+                  ? 'text-amber-400'
+                  : 'text-zinc-500 hover:text-zinc-300'
+              }`}
+              title={musicTrackLocked ? '음악 트랙 잠금 해제' : '음악 트랙 잠금'}
+            >
+              {musicTrackLocked ? (
+                <Lock className="w-3 h-3" />
+              ) : (
+                <Unlock className="w-3 h-3" />
+              )}
+            </button>
             <Music className="w-3 h-3 shrink-0" />
             <span className="truncate">음악</span>
           </div>
@@ -738,6 +833,7 @@ export function Timeline({
                     r.top <= selRect.bottom &&
                     r.bottom >= selRect.top
                   if (!intersects) return
+                  if (node.dataset.clipLocked === 'true') return
                   const kind = node.dataset.clipKind
                   const id = node.dataset.clipId
                   if (!id) return
@@ -781,6 +877,11 @@ export function Timeline({
                         tabIndex={0}
                         data-clip-kind="text"
                         data-clip-id={t.id}
+                        data-clip-locked={
+                          lockedCaptionLayers.includes(layerIdx)
+                            ? 'true'
+                            : 'false'
+                        }
                         onPointerDown={(e) =>
                           startClipDrag(
                             e,
@@ -796,7 +897,11 @@ export function Timeline({
                         onPointerUp={endClipDrag}
                         onPointerCancel={endClipDrag}
                         style={{ left: `${left}px`, width: `${width}px` }}
-                        className={`group absolute top-1 bottom-1 rounded px-2.5 flex items-center text-left text-xs truncate border transition-colors cursor-grab active:cursor-grabbing ${
+                        className={`group absolute top-1 bottom-1 rounded px-2.5 flex items-center text-left text-xs truncate border transition-colors ${
+                          lockedCaptionLayers.includes(layerIdx)
+                            ? 'opacity-65 cursor-not-allowed'
+                            : 'cursor-grab active:cursor-grabbing'
+                        } ${
                           isSelected
                             ? t.isDynamic
                               ? 'bg-amber-600/40 border-amber-400 text-white ring-1 ring-amber-400/50'
@@ -821,8 +926,25 @@ export function Timeline({
                           onPointerMove={moveClipDrag}
                           onPointerUp={endClipDrag}
                           onPointerCancel={endClipDrag}
+                          onDoubleClick={(e) => {
+                            e.stopPropagation()
+                            if (lockedCaptionLayers.includes(layerIdx)) return
+                            const targetVideo =
+                              findActiveVideoClip(videoClips, playhead) ??
+                              videoClips.find(
+                                (v) =>
+                                  t.timelineStart < v.timelineStart + v.duration &&
+                                  t.timelineStart + t.duration > v.timelineStart,
+                              )
+                            if (!targetVideo) return
+                            onBeginDrag?.()
+                            const end = t.timelineStart + t.duration
+                            const nextStart = targetVideo.timelineStart
+                            const nextDuration = Math.max(0.1, end - nextStart)
+                            onResizeTextClip(t.id, nextStart, nextDuration)
+                          }}
                           className="absolute left-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-violet-400/50 rounded-l"
-                          title="왼쪽 경계 드래그로 시작/길이 조절"
+                          title="왼쪽 경계 드래그로 시작/길이 조절 (더블클릭: 현재 영상 클립 왼쪽 맞춤)"
                         />
                         <span className="truncate pointer-events-none flex items-center gap-1">
                           {t.isDynamic && (
@@ -845,8 +967,28 @@ export function Timeline({
                           onPointerMove={moveClipDrag}
                           onPointerUp={endClipDrag}
                           onPointerCancel={endClipDrag}
+                          onDoubleClick={(e) => {
+                            e.stopPropagation()
+                            if (lockedCaptionLayers.includes(layerIdx)) return
+                            const targetVideo =
+                              findActiveVideoClip(videoClips, playhead) ??
+                              videoClips.find(
+                                (v) =>
+                                  t.timelineStart < v.timelineStart + v.duration &&
+                                  t.timelineStart + t.duration > v.timelineStart,
+                              )
+                            if (!targetVideo) return
+                            onBeginDrag?.()
+                            const targetEnd =
+                              targetVideo.timelineStart + targetVideo.duration
+                            const nextDuration = Math.max(
+                              0.1,
+                              targetEnd - t.timelineStart,
+                            )
+                            onResizeTextClip(t.id, t.timelineStart, nextDuration)
+                          }}
                           className="absolute right-0 top-0 bottom-0 w-2 cursor-ew-resize hover:bg-violet-400/50 rounded-r"
-                          title="오른쪽 경계 드래그로 길이 조절"
+                          title="오른쪽 경계 드래그로 길이 조절 (더블클릭: 현재 영상 클립 오른쪽 맞춤)"
                         />
                       </div>
                     )
@@ -870,6 +1012,7 @@ export function Timeline({
                     tabIndex={0}
                     data-clip-kind="video"
                     data-clip-id={clip.id}
+                    data-clip-locked={videoTrackLocked ? 'true' : 'false'}
                     onPointerDown={(e) =>
                       startClipDrag(
                         e,
@@ -887,7 +1030,11 @@ export function Timeline({
                     onPointerUp={endClipDrag}
                     onPointerCancel={endClipDrag}
                     style={{ left: `${left}px`, width: `${width}px` }}
-                    className={`group absolute top-1.5 bottom-1.5 rounded px-2.5 flex flex-col justify-center text-left border transition-colors overflow-hidden cursor-grab active:cursor-grabbing ${
+                    className={`group absolute top-1.5 bottom-1.5 rounded px-2.5 flex flex-col justify-center text-left border transition-colors overflow-hidden ${
+                      videoTrackLocked
+                        ? 'opacity-65 cursor-not-allowed'
+                        : 'cursor-grab active:cursor-grabbing'
+                    } ${
                       isSelected
                         ? 'bg-sky-600/35 border-sky-400 text-white ring-1 ring-sky-400/50'
                         : 'bg-sky-950/60 border-sky-800/70 text-sky-100 hover:border-sky-600'
