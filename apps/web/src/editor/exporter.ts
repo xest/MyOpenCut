@@ -269,16 +269,42 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
     },
   })
 
-  videoEncoder.configure({
-    codec: 'avc1.64002a', // H.264 High Profile L4.2 (supports 1080p30)
+  const baseConfig: VideoEncoderConfig = {
+    codec: 'avc1.64002a',
     width,
     height,
     bitrate: 12_000_000,
     framerate: fps,
-    hardwareAcceleration: 'prefer-hardware',
-    latencyMode: 'realtime',
-    avc: { format: 'avc' },
-  })
+  }
+  const candidateConfigs: VideoEncoderConfig[] = [
+    {
+      ...baseConfig,
+      hardwareAcceleration: 'prefer-hardware',
+      latencyMode: 'realtime',
+    },
+    {
+      ...baseConfig,
+      hardwareAcceleration: 'prefer-hardware',
+    },
+    baseConfig,
+    { ...baseConfig, codec: 'avc1.4d002a' },
+    { ...baseConfig, codec: 'avc1.42002a' },
+  ]
+
+  let chosenConfig: VideoEncoderConfig = baseConfig
+  for (const cfg of candidateConfigs) {
+    try {
+      const support = await VideoEncoder.isConfigSupported(cfg)
+      if (support.supported) {
+        chosenConfig = cfg
+        break
+      }
+    } catch {
+      // Try next candidate
+    }
+  }
+
+  videoEncoder.configure(chosenConfig)
 
   let audioEncoder: AudioEncoder | null = null
   if (hasAudio && mixedAudio) {
@@ -311,6 +337,30 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
       const asset = assets[assetId]
       if (asset && asset.kind === 'video') {
         videoElements.set(assetId, await createHiddenVideo(asset.url))
+      }
+    }
+  }
+
+  // Pre-capture clean-plate background snapshots for object-removal masks
+  const cleanPlates = new Map<string, HTMLCanvasElement>()
+  if (!videoTrackHidden) {
+    for (const clip of videoClips) {
+      for (const mask of clip.masks ?? []) {
+        if (mask.mode !== 'clean-plate') continue
+        const refTime = mask.refSourceTime ?? clip.sourceStart
+        const key = `${clip.assetId}:${refTime.toFixed(2)}`
+        if (cleanPlates.has(key)) continue
+        const v = videoElements.get(clip.assetId)
+        if (!v) continue
+        await seekVideo(v, refTime)
+        const snap = document.createElement('canvas')
+        snap.width = v.videoWidth || width
+        snap.height = v.videoHeight || height
+        const sCtx = snap.getContext('2d')
+        if (sCtx) {
+          sCtx.drawImage(v, 0, 0, snap.width, snap.height)
+          cleanPlates.set(key, snap)
+        }
       }
     }
   }
@@ -372,6 +422,7 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
         videoElement: videoEl,
         videoClip: activeClip,
         activeTexts,
+        cleanPlates,
         currentTime: time,
         showSafeZone: false,
       })
@@ -380,6 +431,10 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
         timestamp: f * frameDurationUs,
         duration: frameDurationUs,
       })
+      if (videoEncoder.state === 'closed') {
+        frame.close()
+        throw encoderError ?? new Error('VideoEncoder가 예기치 않게 종료되었습니다.')
+      }
       videoEncoder.encode(frame, { keyFrame: f % (fps * 2) === 0 })
       frame.close()
 
@@ -431,8 +486,11 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
     }
 
     onProgress?.(0.96, 'MP4 파일 마무리 중...')
+    if (videoEncoder.state === 'closed') {
+      throw encoderError ?? new Error('VideoEncoder가 예기치 않게 종료되었습니다.')
+    }
     await videoEncoder.flush()
-    if (audioEncoder) {
+    if (audioEncoder && audioEncoder.state !== 'closed') {
       await audioEncoder.flush()
     }
     muxer.finalize()
@@ -441,8 +499,12 @@ export async function exportFhdMp4(options: ExportOptions): Promise<Blob> {
     onProgress?.(1, '완료!')
     return new Blob([buffer], { type: 'video/mp4' })
   } finally {
-    videoEncoder.close()
-    audioEncoder?.close()
+    if (videoEncoder.state !== 'closed') {
+      videoEncoder.close()
+    }
+    if (audioEncoder && audioEncoder.state !== 'closed') {
+      audioEncoder.close()
+    }
     for (const v of videoElements.values()) {
       v.src = ''
       v.load()
