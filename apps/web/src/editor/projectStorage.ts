@@ -110,6 +110,8 @@ export async function saveProjectWithHandle(
   project: ProjectFileV1,
   existingHandle: FileSystemFileHandle | null,
   forceSaveAs = false,
+  startInDir?: FileSystemDirectoryHandle | null,
+  currentFileName?: string | null,
 ): Promise<{
   saved: boolean
   handle: FileSystemFileHandle | null
@@ -118,7 +120,8 @@ export async function saveProjectWithHandle(
   const json = JSON.stringify(project, null, 2)
   const blob = new Blob([json], { type: 'application/json' })
   const stamp = new Date().toISOString().slice(0, 10)
-  const suggestedName = `project-${stamp}.kremble.json`
+  const suggestedName =
+    currentFileName || existingHandle?.name || `project-${stamp}.kremble.json`
 
   const win = window as Window & {
     showSaveFilePicker?: (opts?: unknown) => Promise<FileSystemFileHandle>
@@ -136,16 +139,28 @@ export async function saveProjectWithHandle(
   }
 
   if (typeof win.showSaveFilePicker === 'function') {
+    const pickerTypes = [
+      {
+        description: 'Kremble Cut 프로젝트 파일',
+        accept: { 'application/json': ['.json'] },
+      },
+    ]
+    const startInTarget = startInDir ?? existingHandle ?? undefined
     try {
-      const handle = await win.showSaveFilePicker({
-        suggestedName,
-        types: [
-          {
-            description: 'Kremble Cut 프로젝트 파일',
-            accept: { 'application/json': ['.json'] },
-          },
-        ],
-      })
+      let handle: FileSystemFileHandle
+      try {
+        handle = await win.showSaveFilePicker({
+          suggestedName,
+          ...(startInTarget ? { startIn: startInTarget } : {}),
+          types: pickerTypes,
+        })
+      } catch (innerErr) {
+        if ((innerErr as Error).name === 'AbortError') throw innerErr
+        handle = await win.showSaveFilePicker({
+          suggestedName,
+          types: pickerTypes,
+        })
+      }
       const writable = await handle.createWritable()
       await writable.write(blob)
       await writable.close()
