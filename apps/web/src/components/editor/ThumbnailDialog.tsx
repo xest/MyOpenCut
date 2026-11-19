@@ -43,6 +43,7 @@ interface ThumbnailDialogProps {
   videoClip: VideoClip | null
   activeTexts: TextClip[]
   workspaceDirHandle?: FileSystemDirectoryHandle | null
+  projectBaseName?: string
 }
 
 const THUMB_PREFS_KEY = 'myopencut.thumbnail.prefs.v1'
@@ -56,6 +57,7 @@ export function ThumbnailDialog({
   videoClip,
   activeTexts,
   workspaceDirHandle = null,
+  projectBaseName = 'kremble',
 }: ThumbnailDialogProps) {
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const [savedNotice, setSavedNotice] = useState<string | null>(null)
@@ -63,6 +65,7 @@ export function ThumbnailDialog({
   const [options, setOptions] = useState<ThumbnailOptions>({
     dimEnabled: false,
     dimPercent: 20,
+    grayscaleEnabled: true,
     overrideTextEnabled: false,
     overrideText: '',
     overrideTextColor: '#FFFFFF',
@@ -176,7 +179,7 @@ export function ThumbnailDialog({
     showSafeZone,
   ])
 
-  const handleDownload = (format: 'png' | 'jpeg') => {
+  const handleDownload = () => {
     const outCanvas = document.createElement('canvas')
     outCanvas.width = preset.width
     outCanvas.height = preset.height
@@ -196,8 +199,9 @@ export function ThumbnailDialog({
       showSafeZone: false,
     })
 
-    const mime = format === 'png' ? 'image/png' : 'image/jpeg'
-    const fileName = `thumbnail-${aspectRatio.replace(':', 'x')}-${playhead.toFixed(2)}s.${format}`
+    const mime = 'image/png'
+    const base = projectBaseName.trim() || 'kremble'
+    const fileName = `${base}_thumbnail.png`
     outCanvas.toBlob(
       async (blob) => {
         if (!blob) return
@@ -221,7 +225,6 @@ export function ThumbnailDialog({
         URL.revokeObjectURL(url)
       },
       mime,
-      0.95,
     )
   }
 
@@ -327,6 +330,29 @@ export function ThumbnailDialog({
                   }}
                 />
               )}
+              <div className="flex items-center justify-between pt-1 border-t border-zinc-800/70">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="thumb-grayscale"
+                    checked={Boolean(options.grayscaleEnabled)}
+                    onCheckedChange={(checked) =>
+                      setOptions((prev) => ({
+                        ...prev,
+                        grayscaleEnabled: Boolean(checked),
+                      }))
+                    }
+                  />
+                  <Label
+                    htmlFor="thumb-grayscale"
+                    className="text-xs font-medium cursor-pointer"
+                  >
+                    그레이스케일(흑백) 적용
+                  </Label>
+                </div>
+                <span className="text-xs font-mono text-sky-400">
+                  {options.grayscaleEnabled ? 'ON' : 'OFF'}
+                </span>
+              </div>
             </div>
 
             {/* Replacement Overlay Text */}
@@ -491,21 +517,11 @@ export function ThumbnailDialog({
               <Button
                 type="button"
                 size="sm"
-                className="flex-1 bg-sky-500 hover:bg-sky-600 text-white"
-                onClick={() => handleDownload('png')}
+                className="w-full bg-sky-500 hover:bg-sky-600 text-white"
+                onClick={() => handleDownload()}
               >
                 <Download className="w-4 h-4 mr-1.5" />
                 PNG 저장
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                className="flex-1 border-zinc-700 text-zinc-200 hover:bg-zinc-800"
-                onClick={() => handleDownload('jpeg')}
-              >
-                <Download className="w-4 h-4 mr-1.5" />
-                JPG 저장
               </Button>
             </div>
           </div>
